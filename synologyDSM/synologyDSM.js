@@ -1,0 +1,2827 @@
+/***************************************************************
+ * Synology DSM – API-first Adapter-Ersatz – v37.2M12-JS9
+ * Optimiert für JavaScript-Adapter >= 9.0.11
+ * (c) ilovegym66
+ * Änderungen ggü. v37.2M:
+ * - JS9-kompatibel: kein urlparams, kein readDir
+ * - safeSet mit "change only" (verhindert >1000 setState/min)
+ * - VIS-Snapshot-URLs explizit über http + Port-Mapping
+ * - VMM/Virtualization-API robust (Fehler nur als Warnungen)
+ ***************************************************************/
+'use strict';
+
+/*** === KONFIG === ***/
+const CFG = {
+  ROOT: '0_userdata.0.Geraete.Synology',
+
+  HOST: 'IPofSynology',    
+  PORT: 5551,    //Port
+  HTTPS: true,    
+
+  USER: 'place your username here',
+  PASS: 'place your password here',
+  OTP:  '',
+
+  POLL_MS: 30_000,
+  LONG_POLL_MS: 120_000,
+  START_DELAY_MS: 2_000,
+
+  ENABLE: {
+    UTILIZATION:   true,
+    NETWORK:       true,
+    STORAGE:       true,
+    SESSIONS:      true,
+    DOCKER:        true,
+    VMM:           true,
+    SURVEILLANCE:  true,
+    DASHBOARD:     true
+  },
+
+  SILENT: true,
+  VERBOSE_WARN: true,
+
+  // Discord Adapter-States
+  DISCORD_SEND_TEXT: 'alias.0.Haus.Notifications.Security.send'/*Notify Security send*/,
+  DISCORD_SEND_FILE: 'alias.0.Haus.Notifications.Security.sendFile'/*Notify Security sendFile*/,
+
+  // Öffentliche Dateien-URL (genau diese Base!)
+  IOB_FILES_BASE: 'http://10.1.1.2:8081/files',   // http://10.1.1.2:8081 is iobroker-Admin
+  IOB_FILES_ADAPTER: '0_userdata.0',
+  IOB_FILES_DIRS: ['/screenshots','/Screenshot'],     
+
+  // Auto-Delete von Snapshots, 0 = behalten
+  SNAP_DELETE_MS: 120_000,    // 2 Minuten
+
+  // HTTP-Endpoint für VIS-Snapshots
+  VIS_HTTP: { HOST: 'IPfromSynology', PORT: 5550 },
+
+  // Dashboards
+  DASHBOARD_MAIN:  '0_userdata.0.vis.Dashboards.Synology',    // Dashboard Prime 
+  DASHBOARD_SURV:  '0_userdata.0.vis.Dashboards.Surveillance', // Dashboard Surveillance
+
+  // Interface-Reihenfolge
+  NET_IF_SORT: ['ovs_eth0','ovs_eth1','ovs_eth2','ovs_eth3','eth0','eth1','eth2','eth3','bond','pppoe','ppoe'],
+
+  REQ_TIMEOUT_MS: 45000,
+  LOGIN_RETRY_MS: 10000,
+
+  SURV_VIS_HTTP_PORT: 5550,
+
+  DEBUG_HTTP: false,
+  DEBUG_API:  false,
+  // Data-URI Snapshots für MinuVis (imgoutput)
+  SURV_DATAURI: {
+    ENABLED: true,                // globaler Schalter
+    CAM_KEYS: [ ],
+    // Minimale Zeit zwischen zwei Updates (pro PollOnce)
+    FILE_EXPORT_BASEDIR: '/minukodu/SurvSnap',
+    MIN_INTERVAL_MS: 20_000
+  },
+  ALERTS: {
+    ENABLED: true,
+    SYS_TEMP_C_WARN: 65,
+    DISK_TEMP_C_WARN: 38,
+    COOLDOWN_MS: 30*60*1000
+  },
+};
+
+// Wie soll an Discord .sendFile geliefert werden?
+// 'rel'  → "0_userdata.0/screenshots/<file>"  (entspricht deinem funktionierenden Klein-Script)
+// 'abs'  → "/0_userdata.0/screenshots/<file>"
+// 'http' → "http://<host>:8081/files/0_userdata.0/screenshots/<file>"
+const CFG_SEND_FILE_MODE = 'rel';   // <<— auf 'rel' lassen
+const CFG_SEND_TEXT_WITH_URL = false; // optional: zusätzlich URL via .send posten?
+
+/*** === MINI SURVEILLANCE HTML (für Browser / MinuVis-iframe) === ***/
+const SURV_MINI_HTML = {
+  ENABLED: true,
+
+  // Wohin soll die HTML-Datei geschrieben werden (im 0_userdata.0 Filesystem)?
+  // Ergibt URL: http://<ioBroker>:8081/files/0_userdata.0/minukodu/SurvMini.html
+  FILE_PATH: '/minukodu/SurvMini.html',
+
+  TITLE: 'Synology – Mini Surveillance',
+
+  // Welche Kameras sollen angezeigt werden (Keys wie im Statepfad)
+  CAM_KEYS: ['A-Hofeinfahrt','B-Haustuer','E-Schiebetor']
+};
+
+/*** === RUNTIME === ***/
+
+const http  = require('http');
+const https = require('https');
+const { URL } = require('url');
+
+const HTTPS_AGENT = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
+const HTTP_AGENT  = new http.Agent({  keepAlive: true });
+
+const BASE  = `${CFG.HTTPS?'https':'http'}://${CFG.HOST}:${CFG.PORT}`;
+
+let SID = '';
+let AUTH = { sid: '', token: '' };
+const SESS = {};
+let API_MAP = {};
+let LAST_LONG = 0;
+// eigener SID nur für Snapshot-URLs (klassischer Auth ohne SynoToken)
+let SURV_SID = '';
+
+const CACHE = { network:null, volumes:null, disks:null, docker:null, vmm:null, cams:null };
+const RATE = {}; // {dev:{rxLast,txLast,tsLast,mode,rxRate_kBps,txRate_kBps,upScore}}
+const J = JSON.stringify;
+
+let LAST_SURV_DATAURI = 0;   // Timestamp für letzte Data-URI Aktualisierung
+let POLL_COUNTER = 0;
+
+
+/*** === Helpers === ***/
+
+function idJoin(){ return Array.from(arguments).filter(Boolean).join('.'); }
+function idSafe(s){ return String(s||'').trim().replace(/[^\w\-]+/g,'_').replace(/^_+|_+$/g,''); }
+function say(lvl,msg){
+  if (CFG.SILENT && (lvl==='warn'||lvl==='error') && !CFG.VERBOSE_WARN) return;
+  log(msg,lvl);
+}
+
+function existsAsync(id){
+  return new Promise(res => getObject(id, (_e,o)=>res(!!o)));
+}
+
+function createStateAsync(id, common, native){
+  return new Promise((res,rej)=>{
+    const parts=id.split('.'); parts.pop(); let p='';
+    (function mk(i){
+      if (i>=parts.length){
+        setObject(id,{type:'state',common:{name:id,read:true,write:false,role:'state',...common},native:native},(e)=>e?rej(e):res());
+        return;
+      }
+      p = p ? p+'.'+parts[i] : parts[i];
+      getObject(p,(_e,o)=>{
+        if(!o){
+          setObject(p,{type:'channel',common:{name:p},native:{}},()=>mk(i+1));
+        } else {
+          mk(i+1);
+        }
+      });
+    })(0);
+  });
+}
+
+async function ensureState(id, common={}, native={}){
+  if (!id) return;
+  try{
+    if(!await existsAsync(id)) await createStateAsync(id, common, native);
+  }catch(e){
+    say('warn',`ensureState(${id}) error: ${e}`);
+  }
+}
+
+// change-only safeSet → reduziert setState-Last massiv
+async function safeSet(id, val, ack = true) {
+  try {
+    // JS 9.x: saubere Signatur (id, value, ack)
+    await setStateAsync(id, val, ack);
+  } catch (e) {
+    say('warn', `safeSet(${id}) error: ${e}`);
+  }
+}
+
+
+async function safeGet(id, dflt=null){
+  if (!id) return dflt;
+  try{
+    const s=await getStateAsync(id);
+    return s && s.val!==undefined ? s.val : dflt;
+  }catch{
+    return dflt;
+  }
+}
+
+function enc(params){
+  return Object.entries(params)
+    .map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join('&');
+}
+
+function toVisHttp(fullUrl){
+  try {
+    const u = new URL(String(fullUrl));
+    u.protocol = 'http:';
+    u.hostname = (CFG.VIS_HTTP && CFG.VIS_HTTP.HOST) || CFG.HOST;
+    if (CFG.VIS_HTTP && CFG.VIS_HTTP.PORT) {
+      u.port = String(CFG.VIS_HTTP.PORT);
+    }
+    return u.toString();
+  } catch(e){
+    const m = String(fullUrl || '').match(/https?:\/\/[^/]+(\/.*)$/i);
+    const tail = m ? m[1] : String(fullUrl || '');
+    const host = (CFG.VIS_HTTP && CFG.VIS_HTTP.HOST) || CFG.HOST;
+    const port = (CFG.VIS_HTTP && CFG.VIS_HTTP.PORT)
+      ? `:${CFG.VIS_HTTP.PORT}`
+      : (CFG.PORT ? `:${CFG.PORT}` : '');
+    return `http://${host}${port}${tail}`;
+  }
+}
+
+/*** === HTTP / API === ***/
+function normalizePath(p){
+  if(!p) return '/webapi/entry.cgi';
+  if(/^https?:\/\//i.test(p)) return p;
+  if(p[0] !== '/') p = '/' + p;
+  if(!p.startsWith('/webapi/')){
+    if(/\/?(entry|auth|query|otp)\.cgi$/i.test(p)){
+      p = '/webapi/' + p.replace(/^\//,'');
+    }
+  }
+  return p;
+}
+
+function apiPath(api){
+  const m=API_MAP[api]; if(!m) return {path:'/webapi/entry.cgi', ver:1};
+  return { path: normalizePath(m.path || '/webapi/entry.cgi'), ver: m.maxVersion || m.minVersion || 1 };
+}
+
+function doRequest(path, method='GET', params={}, body=null){
+  return new Promise((resolve,reject)=>{
+    const norm   = normalizePath(path);
+    const isAbs  = /^https?:\/\//i.test(norm);
+    const isGet  = method === 'GET';
+    const query  = isGet && params && Object.keys(params).length ? `?${enc(params)}` : '';
+    const url    = isAbs ? `${norm}${query}` : `${BASE}${norm}${query}`;
+    const mod    = isAbs ? (url.startsWith('https') ? https : http) : (CFG.HTTPS ? https : http);
+
+    const headers = {
+      'Accept'      : 'application/json',
+      'User-Agent'  : 'ioBroker-Synology-API-Client',
+      'Content-Type': 'application/x-www-form-urlencoded'
+    };
+
+    if (AUTH.sid)   headers['Cookie']       = `id=${AUTH.sid}`;
+    if (AUTH.token) headers['X-SYNO-TOKEN'] = AUTH.token;
+
+    const opts = {
+  method,
+  headers,
+  timeout: CFG.REQ_TIMEOUT_MS,
+  agent  : url.startsWith('https') ? HTTPS_AGENT : HTTP_AGENT,
+  rejectUnauthorized: false
+};
+
+
+    if (CFG.DEBUG_HTTP) log(`HTTP ${method} ${url}`,'info');
+
+    const req = mod.request(url, opts, (res)=>{
+      const bufs = [];
+      res.on('data', d => bufs.push(d));
+      res.on('end', ()=>{
+        const raw = Buffer.concat(bufs).toString('utf8');
+        if (CFG.DEBUG_HTTP) log(`← ${res.statusCode}: ${raw.slice(0,600)}...`,'info');
+        if ([200,302,400].includes(res.statusCode)){
+          try {
+            resolve({ status:res.statusCode, headers:res.headers, json: raw ? JSON.parse(raw) : {}, raw });
+          } catch(_e){
+            resolve({ status:res.statusCode, headers:res.headers, json:null, raw });
+          }
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0,400)}`));
+        }
+      });
+    });
+
+    req.on('timeout', ()=> req.destroy(new Error('timeout')));
+    req.on('error', reject);
+
+    if (!isGet && body){
+      req.write(body);
+    }
+
+    req.end();
+  });
+}
+
+
+function fetchBinaryWithType(url){
+  return new Promise((resolve,reject)=>{
+    const u = String(url || '');
+    if (!u) return reject(new Error('fetchBinaryWithType: empty url'));
+
+    const isHttps = u.startsWith('https');
+    const mod     = isHttps ? https : http;
+
+    const headers = {
+      'User-Agent': 'ioBroker-Synology-API-Client',
+      'Accept'    : '*/*'
+    };
+    if (AUTH.sid)   headers['Cookie']       = `id=${AUTH.sid}`;
+    if (AUTH.token) headers['X-SYNO-TOKEN'] = AUTH.token;
+
+    const opts = {
+      headers,
+      timeout: CFG.REQ_TIMEOUT_MS,
+      // HTTPS → unseren Agent benutzen, HTTP → Default-Agent
+      agent  : isHttps ? HTTPS_AGENT : HTTP_AGENT,
+
+      rejectUnauthorized: false
+    };
+
+    const req = mod.get(u, opts, (res)=>{
+      const chunks = [];
+      const ct = res.headers['content-type'] || '';
+      res.on('data', d => chunks.push(d));
+      res.on('end', ()=> resolve({
+        buf        : Buffer.concat(chunks),
+        contentType: ct,
+        status     : res.statusCode || 0
+      }));
+    });
+
+    req.on('timeout', ()=> req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+
+function probeUrl(url, timeoutMs=5000){
+  return new Promise((resolve)=>{
+    const u = String(url || '');
+    if (!u) return resolve(false);
+
+    const mod = u.startsWith('https') ? https : http;
+
+    const headers = {};
+    if (AUTH.sid)   headers['Cookie']       = `id=${AUTH.sid}`;
+    if (AUTH.token) headers['X-SYNO-TOKEN'] = AUTH.token;
+
+    const opts = {
+      timeout: timeoutMs,
+      agent  : u.startsWith('https') ? HTTPS_AGENT : HTTP_AGENT,
+
+      rejectUnauthorized: false,
+      headers
+    };
+
+    const req = mod.get(u, opts, res=>{
+      res.resume();
+      resolve(res.statusCode>=200 && res.statusCode<300);
+    });
+
+    req.on('timeout', ()=>{ req.destroy(); resolve(false); });
+    req.on('error',  ()=> resolve(false));
+  });
+}
+
+
+async function callApi(api, method, params={}){
+  const {path, ver} = apiPath(api);
+  const full = { api, method, version: ver, ...params };
+  const r = await doRequest(path,'GET', full);
+  if (!r.json){
+    if (r.status===401 || (r.raw && /119/.test(r.raw))) throw new Error('Unauthorized');
+    throw new Error(`API ${api}.${method} no json`);
+  }
+  if (!r.json.success){
+    if (r.json.error?.code===119) throw new Error('Unauthorized');
+    if (CFG.DEBUG_API) log(`API ERR ${api}.${method} → ${JSON.stringify(r.json.error)}`,'warn');
+    throw new Error(`API ${api}.${method} error: ${JSON.stringify(r.json.error)}`);
+  }
+  return r.json.data;
+}
+
+/*** === LOGIN (Sessions) === ***/
+/*** === LOGIN (Mehrere Sessions + extra Surveillance-SID) === ***/
+async function loginSession(sessionName, makeDefault, options) {
+  const opt = options || {};
+  // Standard: für Core/Storage/Virtualization/Docker -> SynoToken + SID benutzen
+  const useToken = opt.useToken !== undefined ? !!opt.useToken : true;
+
+  const p = {
+    api    : 'SYNO.API.Auth',
+    method : 'login',
+    version: '7',
+    account: CFG.USER,
+    passwd : CFG.PASS,
+    session: sessionName,
+    format : 'sid'
+  };
+  if (useToken) {
+    p.enable_syno_token = 'yes';
+  }
+  if (CFG.OTP) p.otp_code = CFG.OTP;
+
+  const r = await doRequest('/webapi/auth.cgi', 'GET', p);
+
+  if (r.json?.success && r.json.data?.sid) {
+    const sid   = r.json.data.sid;
+    const token = useToken ? (r.json.data.synotoken || r.json.data['synotoken'] || '') : '';
+
+    SESS[sessionName] = { sid, token };
+
+    if (makeDefault) {
+      AUTH.sid   = sid;
+      AUTH.token = token;
+      SID        = sid;   // für alten Code
+    }
+    return true;
+  }
+
+  return false;
+}
+
+// Eigener "Legacy"-Login NUR für Surveillance Station, damit _sid in der URL für Snapshots funktioniert
+async function loginSurveillanceLegacy() {
+  SURV_SID = '';
+  try {
+    const p = {
+      api    : 'SYNO.API.Auth',
+      method : 'login',
+      version: '3',                 // bewusst "klassisch"
+      account: CFG.USER,
+      passwd : CFG.PASS,
+      session: 'SurveillanceStation',
+      format : 'sid'
+    };
+    if (CFG.OTP) p.otp_code = CFG.OTP;
+
+    const r = await doRequest('/webapi/auth.cgi', 'GET', p);
+
+    if (r.json?.success && r.json.data?.sid) {
+      SURV_SID = r.json.data.sid;
+
+      // im Sessions-Objekt ablegen (nur SID, kein Token)
+      SESS.SurveillanceStation = SESS.SurveillanceStation || {};
+      SESS.SurveillanceStation.sid = SURV_SID;
+
+      // Diagnose-State
+      await ensureState(idJoin(CFG.ROOT, 'Info.auth.survSid'), { type: 'string', role: 'text' });
+      await safeSet(idJoin(CFG.ROOT, 'Info.auth.survSid'), SURV_SID);
+
+      if (!CFG.SILENT) log(`SurveillanceStation legacy login OK, SURV_SID=${SURV_SID}`, 'info');
+      return true;
+    }
+
+    say('warn', 'SurveillanceStation legacy login: keine SID erhalten');
+    await ensureState(idJoin(CFG.ROOT, 'Info.auth.survSid'), { type: 'string', role: 'text' });
+    await safeSet(idJoin(CFG.ROOT, 'Info.auth.survSid'), '');
+    return false;
+  } catch (e) {
+    say('warn', 'SurveillanceStation legacy login Fehler: ' + e);
+    SURV_SID = '';
+    await ensureState(idJoin(CFG.ROOT, 'Info.auth.survSid'), { type: 'string', role: 'text' });
+    await safeSet(idJoin(CFG.ROOT, 'Info.auth.survSid'), '');
+    return false;
+  }
+}
+
+async function loginAll() {
+  try {
+    // Alles zurücksetzen
+    AUTH    = { sid: '', token: '' };
+    SID     = '';
+    SURV_SID = '';
+    for (const k of Object.keys(SESS)) delete SESS[k];
+
+    // 1) Core-Session mit Token (für alle "normalen" APIs)
+    const okCore = await loginSession('Core', true, { useToken: true });
+    if (!okCore) throw new Error('Login Core failed');
+
+    await safeSet(idJoin(CFG.ROOT, 'Info.lastLogin'), new Date().toISOString());
+
+    // Diagnose-States
+    await ensureState(idJoin(CFG.ROOT, 'Info.auth.sid'),   { type:'string', role:'text' });
+    await ensureState(idJoin(CFG.ROOT, 'Info.auth.token'), { type:'string', role:'text' });
+    await safeSet(idJoin(CFG.ROOT, 'Info.auth.sid'),   AUTH.sid   || '');
+    await safeSet(idJoin(CFG.ROOT, 'Info.auth.token'), AUTH.token || '');
+
+    // 2) Zusätzliche Sessions (mit Token, Fehler egal)
+    const extra = ['Storage', 'StorageMgr', 'Virtualization', 'Docker'];
+    for (const s of extra) {
+      try { await loginSession(s, false, { useToken: true }); } catch (_e) {}
+    }
+
+    // 3) Surveillance Station: eigener Legacy-Login NUR für Snapshots (SID per _sid in URL)
+    await loginSurveillanceLegacy();  // wenn das fehlschlägt, ist SURV_SID leer -> URL ohne _sid
+
+    return true;
+  } catch (e) {
+    log(`Synology Login Fehler: ${e}`, 'error');
+    SID     = '';
+    AUTH    = { sid: '', token: '' };
+    SURV_SID = '';
+    for (const k of Object.keys(SESS)) delete SESS[k];
+    return false;
+  }
+}
+
+async function logout() {
+  try {
+    await doRequest('/webapi/entry.cgi', 'GET', {
+      api    : 'SYNO.API.Auth',
+      method : 'logout',
+      version: '7',
+      session: 'Core'
+    });
+  } catch (_e) {}
+
+  // Surveillance-Session ebenfalls sauber beenden (best effort)
+  try {
+    await doRequest('/webapi/entry.cgi', 'GET', {
+      api    : 'SYNO.API.Auth',
+      method : 'logout',
+      version: '7',
+      session: 'SurveillanceStation'
+    });
+  } catch (_e) {}
+
+  SID      = '';
+  AUTH     = { sid:'', token:'' };
+  SURV_SID = '';
+  for (const k of Object.keys(SESS)) delete SESS[k];
+}
+
+
+async function loginForSnapshots(){
+  try{
+    const p = {
+      api    : 'SYNO.API.Auth',
+      method : 'login',
+      version: '6',        // klassischer Modus (kein SynoToken, wie "früher")
+      account: CFG.USER,
+      passwd : CFG.PASS,
+      session: 'SurvSnap', // eigene Session nur für Snapshots
+      format : 'sid'
+    };
+    if (CFG.OTP) p.otp_code = CFG.OTP;
+
+    const r = await doRequest('/webapi/auth.cgi','GET', p);
+
+    if (r.json?.success && r.json.data?.sid){
+      SURV_SID = r.json.data.sid;
+
+      // rein informativ:
+      await ensureState(idJoin(CFG.ROOT,'Info.auth.survSnapSid'),
+                        {type:'string',role:'text'});
+      await safeSet(idJoin(CFG.ROOT,'Info.auth.survSnapSid'), SURV_SID);
+
+      if (!CFG.SILENT) {
+        log(`Synology: SurvSnap-SID geholt (${SURV_SID.slice(0,6)}…)`,'info');
+      }
+      return true;
+    }
+    throw new Error(`loginForSnapshots failed: ${JSON.stringify(r.json?.error||{})}`);
+  }catch(e){
+    SURV_SID = '';
+    say('warn',`loginForSnapshots: ${e}`);
+    return false;
+  }
+}
+
+
+
+async function apiInfo(){
+  const r = await doRequest('/webapi/query.cgi','GET',{
+    api:'SYNO.API.Info', method:'query', version:'1', query:'all'
+  });
+  API_MAP = r.json?.data || {};
+  await ensureState(idJoin(CFG.ROOT,'Info.apiMap.json'), {type:'string',role:'json'});
+  await safeSet(idJoin(CFG.ROOT,'Info.apiMap.json'), JSON.stringify(API_MAP));
+}
+
+/*** === Utils === ***/
+function num(x){ const n = typeof x==='string' ? parseFloat(x) : Number(x); return isFinite(n)?n:0; }
+function yes(v){
+  return !!(v===true || v===1 || v==='1' ||
+    /up|on|connected|true|running|online/i.test(String(v)));
+}
+
+function firstIPv4FromObj(o){
+  if (!o) return '';
+  if (typeof o==='string'){
+    const m=o.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+    return m?m[0]:'';
+  }
+  if (Array.isArray(o)){
+    for (const it of o){
+      const f=firstIPv4FromObj(it);
+      if (f) return f;
+    }
+    return '';
+  }
+  return firstIPv4FromObj(o.addresses||o.address||o.ipv4||o.addr||o.ip||o[0]);
+}
+function firstIPv6FromObj(o){
+  if (!o) return '';
+  if (typeof o==='string'){
+    const m=o.match(/\b(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}\b/);
+    return m?m[0]:'';
+  }
+  if (Array.isArray(o)){
+    for (const it of o){
+      const f=firstIPv6FromObj(it);
+      if (f) return f;
+    }
+    return '';
+  }
+  return firstIPv6FromObj(o.addresses||o.address||o.ipv6||o.addr||o.ip||o[0]);
+}
+function fmtLinkSpeed(mbps){
+  const v=num(mbps);
+  if (!isFinite(v)) return '–';
+  if (v<=0) return '0 Mbps';
+  if (v >= 1000) return `${(v/1000).toFixed(v%1000===0?0:1)} Gbps`;
+  return `${v} Mbps`;
+}
+
+/*** === SYSTEM === ***/
+async function fetchSystem(){
+  try{
+    let model='', serial='', dsm='', tz='', uptimeSec=0, load=[0,0,0];
+    let sysTemp=null, sysTempWarn=null;
+    let cpu_family='', cpu_series='', cpu_vendor='', cpu_clock_speed=null, cpu_cores=null;
+    let ntp_enabled=null, ntp_server='';
+    let rp1=null, rp2=null, support_rp=null;
+    let fw_date='', fw_ver='';
+    let flag_ext_nic_incompatible=null, flag_system_crashed=null, flag_upgrade_ready=null;
+
+    try{
+      const dsmi = await callApi('SYNO.DSM.Info','getinfo');
+      model = dsmi.model || model;
+      serial = dsmi.serial || dsmi.serialno || serial;
+      dsm = dsmi.version_string || dsmi.version || dsm;
+      tz = dsmi.time_zone || dsmi.timezone || tz;
+      uptimeSec = num(dsmi.uptime || dsmi.uptime_sec || uptimeSec);
+      sysTemp = num(dsmi.temperature);
+      sysTempWarn = !!dsmi.temperature_warn;
+      if (Array.isArray(dsmi.load_avg)) load = dsmi.load_avg.map(num);
+      if (dsmi.ram && isFinite(num(dsmi.ram)))
+        await safeSet(idJoin(CFG.ROOT,'Utilization.memory.sizeMB'), num(dsmi.ram));
+    }catch{}
+
+    try{
+      const st = await callApi('SYNO.Core.System.Status','get');
+      flag_ext_nic_incompatible = !!st.ext_nic_is_incompatible;
+      flag_system_crashed       = !!st.is_system_crashed;
+      flag_upgrade_ready        = !!st.upgrade_ready;
+    }catch{}
+
+    try{
+      const sys = await callApi('SYNO.Core.System','info');
+      uptimeSec = uptimeSec || num(sys.uptime || sys.uptime_second);
+      model = model || sys.model || sys.modelname;
+      serial = serial || sys.serial || sys.serialno;
+      dsm = dsm || sys.firmware_ver || sys.version;
+      if (!tz) tz = sys.time_zone || sys.timezone;
+
+      sysTemp = isFinite(sysTemp) ? sysTemp : num(sys.sys_temp);
+      sysTempWarn = (sysTempWarn!=null)
+        ? sysTempWarn
+        : !!(sys.sys_tempwarn || sys.temperature_warning || sys.systempwarn);
+
+      cpu_clock_speed = num(sys.cpu_clock_speed);
+      cpu_cores  = num(sys.cpu_cores);
+      cpu_family = sys.cpu_family || '';
+      cpu_series = sys.cpu_series || '';
+      cpu_vendor = sys.cpu_vendor || '';
+
+      ntp_enabled = !!sys.enabled_ntp;
+      ntp_server  = sys.ntp_server || '';
+
+      rp1 = (sys.rp1!=null)?!!sys.rp1:null;
+      rp2 = (sys.rp2!=null)?!!sys.rp2:null;
+      support_rp = !!sys.support_rp;
+
+      fw_date = sys.firmware_date || '';
+      fw_ver  = sys.firmware_ver  || dsm || '';
+      if (Array.isArray(sys.load_avg) && !load[0]) load = sys.load_avg.map(num);
+      if (sys.ram_size && isFinite(num(sys.ram_size)))
+        await safeSet(idJoin(CFG.ROOT,'Utilization.memory.sizeMB'), num(sys.ram_size));
+    }catch{}
+
+    const uptimeHuman = (()=>{
+      const s=uptimeSec; if(!s) return '–';
+      const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
+      return `${d}d ${h}h ${m}m`;
+    })();
+
+    const I = idJoin(CFG.ROOT,'Info');
+    await ensureState(idJoin(I,'model'),      {type:'string',role:'text'});
+    await ensureState(idJoin(I,'serial'),     {type:'string',role:'text'});
+    await ensureState(idJoin(I,'dsmVersion'), {type:'string',role:'text'});
+    await ensureState(idJoin(I,'uptimeSec'),  {type:'number',role:'value.interval',unit:'s'});
+    await ensureState(idJoin(I,'uptimeHuman'),{type:'string',role:'text'});
+    await ensureState(idJoin(I,'timezone'),   {type:'string',role:'text'});
+
+    await ensureState(idJoin(I,'sys.temperature'),           {type:'number',role:'value.temperature',unit:'°C'});
+    await ensureState(idJoin(I,'sys.temperatureWarn'),       {type:'boolean',role:'indicator.alarm'});
+    await ensureState(idJoin(I,'cpu.family'),                {type:'string',role:'text'});
+    await ensureState(idJoin(I,'cpu.series'),                {type:'string',role:'text'});
+    await ensureState(idJoin(I,'cpu.vendor'),                {type:'string',role:'text'});
+    await ensureState(idJoin(I,'cpu.clockMHz'),              {type:'number',role:'value',unit:'MHz'});
+    await ensureState(idJoin(I,'cpu.cores'),                 {type:'number',role:'value'});
+    await ensureState(idJoin(I,'ntp.enabled'),               {type:'boolean',role:'indicator'});
+    await ensureState(idJoin(I,'ntp.server'),                {type:'string',role:'text'});
+    await ensureState(idJoin(I,'psu.rp1.present'),           {type:'boolean',role:'indicator'});
+    await ensureState(idJoin(I,'psu.rp2.present'),           {type:'boolean',role:'indicator'});
+    await ensureState(idJoin(I,'psu.supportRedundant'),      {type:'boolean',role:'indicator'});
+    await ensureState(idJoin(I,'firmware.version'),          {type:'string',role:'text'});
+    await ensureState(idJoin(I,'firmware.date'),             {type:'string',role:'text'});
+    await ensureState(idJoin(I,'flags.extNicIncompatible'),  {type:'boolean',role:'indicator'});
+    await ensureState(idJoin(I,'flags.systemCrashed'),       {type:'boolean',role:'indicator.alarm'});
+    await ensureState(idJoin(I,'flags.upgradeReady'),        {type:'boolean',role:'indicator'});
+
+    if (model)      await safeSet(idJoin(I,'model'), model);
+    if (serial)     await safeSet(idJoin(I,'serial'), serial);
+    if (dsm)        await safeSet(idJoin(I,'dsmVersion'), dsm);
+    if (uptimeSec)  await safeSet(idJoin(I,'uptimeSec'), uptimeSec);
+    await safeSet(idJoin(I,'uptimeHuman'), uptimeHuman);
+    if (tz)         await safeSet(idJoin(I,'timezone'), tz);
+
+    if (isFinite(sysTemp))           await safeSet(idJoin(I,'sys.temperature'), sysTemp);
+    if (sysTempWarn!=null)           await safeSet(idJoin(I,'sys.temperatureWarn'), !!sysTempWarn);
+    if (cpu_family)                  await safeSet(idJoin(I,'cpu.family'), cpu_family);
+    if (cpu_series)                  await safeSet(idJoin(I,'cpu.series'), cpu_series);
+    if (cpu_vendor)                  await safeSet(idJoin(I,'cpu.vendor'), cpu_vendor);
+    if (isFinite(cpu_clock_speed))   await safeSet(idJoin(I,'cpu.clockMHz'), cpu_clock_speed);
+    if (isFinite(cpu_cores))         await safeSet(idJoin(I,'cpu.cores'), cpu_cores);
+    if (ntp_enabled!=null)           await safeSet(idJoin(I,'ntp.enabled'), !!ntp_enabled);
+    if (ntp_server)                  await safeSet(idJoin(I,'ntp.server'), ntp_server);
+    if (rp1!=null)                   await safeSet(idJoin(I,'psu.rp1.present'), !!rp1);
+    if (rp2!=null)                   await safeSet(idJoin(I,'psu.rp2.present'), !!rp2);
+    if (support_rp!=null)            await safeSet(idJoin(I,'psu.supportRedundant'), !!support_rp);
+    if (fw_ver)                      await safeSet(idJoin(I,'firmware.version'), fw_ver);
+    if (fw_date)                     await safeSet(idJoin(I,'firmware.date'), fw_date);
+
+  }catch(e){ say('warn',`fetchSystem: ${e}`); }
+}
+
+/*** === UTILIZATION === ***/
+async function fetchUtilization(){
+  if (!CFG.ENABLE.UTILIZATION) return;
+  try{
+    let data=null;
+    try{ data = await callApi('SYNO.Core.System.Utilization','get'); }catch{}
+    if (!data){ try{ data = await callApi('SYNO.Entry.Request','SYNO.Core.System.Utilization.get'); }catch{} }
+
+    let cpu={}, mem={}, load={};
+    if (data && data.cpu){ cpu  = data.cpu; mem = data.memory || {}; load = data.load || data || {}; }
+
+    const u = {
+      user:   num(cpu.user ?? cpu.user_load),
+      system: num(cpu.system ?? cpu.system_load),
+      wait:   num(cpu.wait ?? cpu.iowait ?? cpu.wait_load),
+      idle:   num(cpu.idle ?? cpu.idle_load)
+    };
+    let total = (u.user||0) + (u.system||0) + (u.wait||0);
+    if (!isFinite(total) || total<=0){
+      if (isFinite(u.idle) && u.idle>0) total = 100 - u.idle;
+    }
+    total = Math.max(0, Math.min(100, Math.round(total)));
+
+    let sizeMB = num(mem.memory_size ?? mem.total ?? mem.total_real)/1024/1024;
+    if (!sizeMB && mem.memory_size) sizeMB = Math.round(num(mem.memory_size)/1024/1024);
+    if (!isFinite(sizeMB) || sizeMB<=0)
+      sizeMB = num(await safeGet(idJoin(CFG.ROOT,'Utilization.memory.sizeMB'),0));
+
+    let usedMB = num(mem.real_usage ?? mem.used ?? mem.used_memory)/1024/1024;
+    if (!usedMB && isFinite(num(mem.available)))
+      usedMB = Math.max(0, Math.round(num(sizeMB) - num(mem.available)/1024/1024));
+    if (!usedMB && isFinite(num(mem.avail_real)) && isFinite(sizeMB))
+      usedMB = Math.max(0, Math.round(sizeMB - num(mem.avail_real)/1024/1024));
+    if (!usedMB && isFinite(num(mem.total_real)) && isFinite(num(mem.avail_real)))
+      usedMB = Math.max(0, Math.round(num(mem.total_real - mem.avail_real)/1024/1024));
+
+    const U = idJoin(CFG.ROOT,'Utilization');
+    await ensureState(idJoin(U,'cpu.total'),    {type:'number',role:'value.percent',unit:'%'});
+    await ensureState(idJoin(U,'cpu.user'),     {type:'number',role:'value.percent',unit:'%'});
+    await ensureState(idJoin(U,'cpu.system'),   {type:'number',role:'value.percent',unit:'%'});
+    await ensureState(idJoin(U,'cpu.wait'),     {type:'number',role:'value.percent',unit:'%'});
+    await ensureState(idJoin(U,'load.1min'),    {type:'number',role:'value'});
+    await ensureState(idJoin(U,'load.5min'),    {type:'number',role:'value'});
+    await ensureState(idJoin(U,'load.15min'),   {type:'number',role:'value'});
+    await ensureState(idJoin(U,'memory.sizeMB'),{type:'number',role:'value',unit:'MB'});
+    await ensureState(idJoin(U,'memory.usedMB'),{type:'number',role:'value',unit:'MB'});
+
+    await safeSet(idJoin(U,'cpu.total'),  total);
+    if (isFinite(u.user))   await safeSet(idJoin(U,'cpu.user'),   Math.round(u.user));
+    if (isFinite(u.system)) await safeSet(idJoin(U,'cpu.system'), Math.round(u.system));
+    if (isFinite(u.wait))   await safeSet(idJoin(U,'cpu.wait'),   Math.round(u.wait));
+
+    const k1=['1min','avg1','la1','1min_load'],
+          k5=['5min','avg5','la5','5min_load'],
+          k15=['15min','avg15','la15','15min_load'];
+    const v1=k1.map(k=>load[k]).find(x=>x!=null),
+          v5=k5.map(k=>load[k]).find(x=>x!=null),
+          v15=k15.map(k=>load[k]).find(x=>x!=null);
+    if (v1!=null)  await safeSet(idJoin(U,'load.1min'), num(v1));
+    if (v5!=null)  await safeSet(idJoin(U,'load.5min'), num(v5));
+    if (v15!=null) await safeSet(idJoin(U,'load.15min'),num(v15));
+
+    if (data && Array.isArray(data.network)){
+      const now = Date.now();
+      for (const n of data.network){
+        const dev = (n.device || 'iface').toString();
+        const rawRx = num(n.rx), rawTx = num(n.tx);
+        RATE[dev] = RATE[dev] || {
+          rxLast:null, txLast:null, tsLast:now,
+          mode:null, upScore:0, rxRate_kBps:0, txRate_kBps:0
+        };
+        let rx_kBps=0, tx_kBps=0;
+        if (RATE[dev].rxLast==null || RATE[dev].txLast==null){
+          RATE[dev].mode = (rawRx>500000 || rawTx>500000) ? 'counter' : 'rate';
+        } else {
+          const dt = Math.max(1, (now - RATE[dev].tsLast)/1000);
+          RATE[dev].mode = (rawRx>=RATE[dev].rxLast && rawTx>=RATE[dev].txLast)
+            ? (RATE[dev].mode||'counter')
+            : 'rate';
+          if (RATE[dev].mode === 'counter'){
+            const dRx = Math.max(0, rawRx - RATE[dev].rxLast);
+            const dTx = Math.max(0, rawTx - RATE[dev].txLast);
+            rx_kBps = dRx / dt; tx_kBps = dTx / dt;
+            if (rx_kBps>5_000_000 || tx_kBps>5_000_000){
+              rx_kBps/=1024; tx_kBps/=1024;
+            }
+          } else {
+            rx_kBps = rawRx; tx_kBps = rawTx;
+          }
+        }
+        RATE[dev].rxLast = rawRx;
+        RATE[dev].txLast = rawTx;
+        RATE[dev].tsLast = now;
+        RATE[dev].rxRate_kBps = Math.max(0, Math.round(rx_kBps));
+        RATE[dev].txRate_kBps = Math.max(0, Math.round(tx_kBps));
+
+        const N=idJoin(CFG.ROOT,'Network','Interfaces', dev);
+        await ensureState(idJoin(N,'rx_kBps'), {type:'number',role:'value',unit:'kB/s'});
+        await ensureState(idJoin(N,'tx_kBps'), {type:'number',role:'value',unit:'kB/s'});
+        await safeSet(idJoin(N,'rx_kBps'), RATE[dev].rxRate_kBps);
+        await safeSet(idJoin(N,'tx_kBps'), RATE[dev].txRate_kBps);
+      }
+    }
+  }catch(e){ say('warn',`fetchUtilization: ${e}`); }
+}
+
+/*** === NETZWERK === ***/
+function membersFromInterface(it){
+  const m=[];
+  if (it?.bond?.slaves) m.push(...it.bond.slaves);
+  if (it?.slaves)       m.push(...it.slaves);
+  if (it?.members)      m.push(...it.members);
+  if (it?.ports)        m.push(...it.ports);
+  if (it?.lowerdev)     m.push(it.lowerdev);
+  const n=(it.id||it.name||it.device||it.ifname||'').toString();
+  const h=n.match(/^ovs_(eth\d+)$/i); if (h) m.push(h[1]);
+  return [...new Set(m.filter(Boolean).map(String))];
+}
+function pickSpeed(it){
+  const cand = [
+    it.speed, it.link_speed, it.speed_mbps,
+    it.rate?.speed, it.rate?.link_speed, it.rate?.max_speed,
+    it.eth?.speed, it.ethernet?.speed, it.max_supported_speed
+  ];
+  for (const v of cand){ const n=num(v); if (n>0) return n; }
+  return 0;
+}
+async function readRxTxState(ifName){
+  const base = idJoin(CFG.ROOT,'Network','Interfaces', ifName);
+  const rx = num(await safeGet(base+'.rx_kBps',0));
+  const tx = num(await safeGet(base+'.tx_kBps',0));
+  return {rx,tx};
+}
+function readRxTxRateFallback(ifName){
+  const r = RATE[ifName];
+  if (r && (r.rxRate_kBps || r.txRate_kBps))
+    return {rx:r.rxRate_kBps||0, tx:r.txRate_kBps||0};
+  return {rx:0,tx:0};
+}
+async function mergedRxTxFor(ifName, itObj){
+  let v = await readRxTxState(ifName);
+  if (v.rx || v.tx) return v;
+  v = readRxTxRateFallback(ifName);
+  if (v.rx || v.tx) return v;
+  const mems = membersFromInterface(itObj);
+  if (mems.length){
+    let rx=0, tx=0;
+    for (const m of mems){
+      const s1 = await readRxTxState(m); rx+=s1.rx; tx+=s1.tx;
+      const s2 = readRxTxRateFallback(m); rx+=s2.rx; tx+=s2.tx;
+    }
+    if (rx || tx) return {rx,tx};
+  }
+  return {rx:0,tx:0};
+}
+
+async function fetchNetwork(){
+  if (!CFG.ENABLE.NETWORK) return;
+  try{
+    let list=null;
+    try{
+      list = await callApi(
+        'SYNO.Core.Network.Interface',
+        'list',
+        {additional:'ip,rate,bond,vlan,pppoe'}
+      );
+    }catch{}
+    if (!list?.interfaces){
+      try{ list = await callApi('SYNO.Core.Network.Ethernet','list'); }catch{}
+    }
+    if (!list?.interfaces){
+      try{ list = await callApi('SYNO.DSM.Network','list'); }catch{}
+    }
+
+    let arr=[];
+    if (list?.interfaces)      arr = list.interfaces;
+    else if (list?.resources)  arr = list.resources;
+    else if (list?.items){
+      arr = list.items.map(x => ({
+        id:x.ifname, name:x.ifname, device:x.ifname,
+        ipv4:x.ip, speed:x.speed, state:x.status, type:x.type, bonded:false, up:x.up
+      }));
+    } else if (Array.isArray(list)) arr = list;
+
+    if (Array.isArray(arr) && arr.length){
+      const byName = {}; for (const it of arr){
+        const n=(it.id||it.name||it.device||it.ifname||'').toString();
+        byName[n]=it;
+      }
+
+      arr.sort((a,b)=>{
+        const A=(a.id||a.name||a.device||'').toString();
+        const B=(b.id||b.name||b.device||'').toString();
+        const ia=CFG.NET_IF_SORT.indexOf(A), ib=CFG.NET_IF_SORT.indexOf(B);
+        if (ia>=0&&ib>=0) return ia-ib;
+        if (ia>=0) return -1;
+        if (ib>=0) return 1;
+        return A.localeCompare(B);
+      });
+
+      const out=[];
+      for (const it of arr){
+        const name=(it.id||it.name||it.device||it.ifname||'iface').toString();
+        const N=idJoin(CFG.ROOT,'Network','Interfaces',name);
+
+        await ensureState(idJoin(N,'up'),   {type:'boolean',role:'indicator.reachable'});
+        await ensureState(idJoin(N,'mac'),  {type:'string', role:'text'});
+        await ensureState(idJoin(N,'ipv4'), {type:'string', role:'text'});
+        await ensureState(idJoin(N,'ipv6'), {type:'string', role:'text'});
+        await ensureState(idJoin(N,'speed'),{type:'number', role:'value', unit:'Mbps'});
+        await ensureState(idJoin(N,'rx_kBps'), {type:'number',role:'value',unit:'kB/s'});
+        await ensureState(idJoin(N,'tx_kBps'), {type:'number',role:'value',unit:'kB/s'});
+
+        const lastUp   = await safeGet(idJoin(N,'up'), null);
+        const lastSpd  = num(await safeGet(idJoin(N,'speed'), 0));
+        const lastIPv4 = await safeGet(idJoin(N,'ipv4'), '');
+        const lastIPv6 = await safeGet(idJoin(N,'ipv6'), '');
+
+        const ipv4 = firstIPv4FromObj(it.ipv4||it.ip||it.addresses||it.address||it.addr) || lastIPv4 || '';
+        const ipv6 = firstIPv6FromObj(it.ipv6||it.addresses||it.address) || lastIPv6 || '';
+        const mac  = it.mac || it.macaddr || it.mac_addr || '';
+        let spd    = pickSpeed(it) || lastSpd;
+
+        if ((!spd || spd===0) && /^ovs_/.test(name)){
+          const mems = membersFromInterface(it);
+          let maxS=0;
+          for (const m of mems){
+            const mit = byName[m]; if (!mit) continue;
+            const ms = pickSpeed(mit); if (ms>maxS) maxS = ms;
+          }
+          if (maxS>0) spd=maxS;
+        }
+
+        const mt = await mergedRxTxFor(name, it);
+
+        RATE[name] = RATE[name] || { upScore: 0 };
+        if (mt.rx>0 || mt.tx>0) RATE[name].upScore = 3;
+        else RATE[name].upScore = Math.max(0, (RATE[name].upScore||0)-1);
+
+        let up = !!it.up || (RATE[name].upScore>0) ||
+                 yes(it.connected) || yes(it.enabled) || yes(it.link_up) ||
+                 (typeof it.operstate==='string' && /up/i.test(it.operstate)) ||
+                 (typeof it.state==='string' && /up|connected|active/i.test(it.state)) ||
+                 yes(it.active) ||
+                 /connected/i.test(String(it.status||''));
+        if (lastUp!==null &&
+            (it.connected===undefined && it.enabled===undefined && it.link_up===undefined &&
+             !/up|connected|active/i.test(String(it.state||''))) ){
+          up = lastUp || (RATE[name].upScore>0);
+        }
+
+        await safeSet(idJoin(N,'up'), up);
+        if (mac)  await safeSet(idJoin(N,'mac'), mac);
+        if (ipv4) await safeSet(idJoin(N,'ipv4'), ipv4);
+        if (ipv6) await safeSet(idJoin(N,'ipv6'), ipv6);
+        await safeSet(idJoin(N,'speed'), spd||0);
+        await safeSet(idJoin(N,'rx_kBps'), Math.max(0, Math.round(mt.rx||0)));
+        await safeSet(idJoin(N,'tx_kBps'), Math.max(0, Math.round(mt.tx||0)));
+
+        out.push({
+          name, up, mac, ipv4, ipv6,
+          speed: spd||0,
+          rx_kBps: Math.max(0, Math.round(mt.rx||0)),
+          tx_kBps: Math.max(0, Math.round(mt.tx||0)),
+          members: membersFromInterface(it)
+        });
+      }
+
+      CACHE.network = out;
+      await ensureState(idJoin(CFG.ROOT,'Network.listJson'), {type:'string',role:'json'});
+      await safeSet(idJoin(CFG.ROOT,'Network.listJson'), J(out));
+      await ensureState(idJoin(CFG.ROOT,'Network.lastUpdated'), {type:'string',role:'text'});
+      await safeSet(idJoin(CFG.ROOT,'Network.lastUpdated'), new Date().toISOString());
+    }
+  }catch(e){ say('warn',`fetchNetwork: ${e}`); }
+}
+
+/*** === STORAGE & DISKS === ***/
+function mbToGb(mb){
+  const n = num(mb);
+  if (!isFinite(n) || n <= 0) return 0;
+  return Math.round((n/1024)*10)/10;
+}
+function getSizeTotalMb(obj){
+  if (!obj) return 0;
+  if (obj.size_mb != null)        return num(obj.size_mb);
+  if (obj.total_size_mb != null)  return num(obj.total_size_mb);
+  if (obj.size_total_mb != null)  return num(obj.size_total_mb);
+  if (obj.total_mb != null)       return num(obj.total_mb);
+
+  if (obj.size && typeof obj.size === 'object'){
+    if (obj.size.total_mb != null) return num(obj.size.total_mb);
+    if (obj.size.total != null)    return num(obj.size.total)/(1024*1024);
+  }
+  if (obj.capacity && typeof obj.capacity === 'object'){
+    if (obj.capacity.size_total != null) return num(obj.capacity.size_total)/(1024*1024);
+  }
+  if (obj.total != null) return num(obj.total)/(1024*1024);
+  return 0;
+}
+function getSizeUsedMb(obj){
+  if (!obj) return 0;
+  if (obj.used_size_mb != null)   return num(obj.used_size_mb);
+  if (obj.size_used_mb != null)   return num(obj.size_used_mb);
+  if (obj.used_mb != null)        return num(obj.used_mb);
+
+  if (obj.size && typeof obj.size === 'object'){
+    if (obj.size.used_mb != null) return num(obj.size.used_mb);
+    if (obj.size.used != null)    return num(obj.size.used)/(1024*1024);
+    if (obj.size.free != null && obj.size.total != null){
+      const tot  = num(obj.size.total)/(1024*1024);
+      const free = num(obj.size.free)/(1024*1024);
+      return Math.max(0, tot-free);
+    }
+  }
+  if (obj.capacity && typeof obj.capacity === 'object'){
+    if (obj.capacity.size_used != null) return num(obj.capacity.size_used)/(1024*1024);
+  }
+  if (obj.used != null) return num(obj.used)/(1024*1024);
+  return 0;
+}
+
+async function fetchStorage(){
+  if (!CFG.ENABLE.STORAGE) return;
+
+  const rootStor = idJoin(CFG.ROOT,'Storage');
+
+  let volOut = [];
+  try{
+    const data = await callApi('SYNO.Storage.CGI.Storage','load_info',{});
+    await ensureState(idJoin(rootStor,'loadInfoRawJson'), {type:'string',role:'json'});
+    await safeSet(idJoin(rootStor,'loadInfoRawJson'), J(data));
+
+    const pools   = Array.isArray(data?.pools)   ? data.pools   : (Array.isArray(data?.pool)   ? data.pool   : []);
+    const volumes = Array.isArray(data?.volumes) ? data.volumes : (Array.isArray(data?.volume) ? data.volume : []);
+
+    for (const p of pools){
+      const idRaw = p.id ?? p.pool_id ?? p.name ?? 'pool';
+      const id    = idSafe(idRaw);
+      const base  = idJoin(rootStor,'Pools', id);
+
+      const sizeTotalMb = getSizeTotalMb(p);
+      const sizeUsedMb  = getSizeUsedMb(p);
+      const sizeFreeMb  = Math.max(0, sizeTotalMb - sizeUsedMb);
+
+      await ensureState(idJoin(base,'name'),         {type:'string',role:'text'});
+      await ensureState(idJoin(base,'status'),       {type:'string',role:'text'});
+      await ensureState(idJoin(base,'raidType'),     {type:'string',role:'text'});
+      await ensureState(idJoin(base,'size.totalGB'), {type:'number',role:'value',unit:'GB'});
+      await ensureState(idJoin(base,'size.usedGB'),  {type:'number',role:'value',unit:'GB'});
+      await ensureState(idJoin(base,'size.freeGB'),  {type:'number',role:'value',unit:'GB'});
+
+      await safeSet(idJoin(base,'name'),   p.name || p.desc || String(idRaw));
+      await safeSet(idJoin(base,'status'), p.status || p.health || '');
+      await safeSet(idJoin(base,'raidType'), p.raid_type || p.type || '');
+      await safeSet(idJoin(base,'size.totalGB'), mbToGb(sizeTotalMb));
+      await safeSet(idJoin(base,'size.usedGB'),  mbToGb(sizeUsedMb));
+      await safeSet(idJoin(base,'size.freeGB'),  mbToGb(sizeFreeMb));
+    }
+
+    const volumeMap = new Map();
+    for (const v of volumes){
+      const key = v.id ?? v.volume_id ?? v.name ?? v.path;
+      if (key != null) volumeMap.set(String(key), v);
+    }
+    for (const p of pools){
+      const pv = Array.isArray(p?.volumes) ? p.volumes : (Array.isArray(p?.volume) ? p.volume : []);
+      for (const v of pv){
+        const key = v.id ?? v.volume_id ?? v.name ?? v.path;
+        if (key != null && !volumeMap.has(String(key)))
+          volumeMap.set(String(key), Object.assign({pool_id:p.id ?? p.pool_id}, v));
+      }
+    }
+
+    for (const [key, v] of volumeMap){
+      const name = String(v.name || key || 'vol');
+      const id   = idSafe(name || key);
+      const base = idJoin(rootStor,'Volumes', id);
+
+      const totalMb = getSizeTotalMb(v);
+      const usedMb  = getSizeUsedMb(v);
+      const freeMb  = Math.max(0, totalMb - usedMb);
+
+      const totalGB = mbToGb(totalMb);
+      const usedGB  = mbToGb(usedMb);
+      const freeGB  = mbToGb(freeMb);
+
+      await ensureState(idJoin(base,'status'),       {type:'string',role:'text'});
+      await ensureState(idJoin(base,'fsType'),       {type:'string',role:'text'});
+      await ensureState(idJoin(base,'size.totalGB'), {type:'number',role:'value',unit:'GB'});
+      await ensureState(idJoin(base,'size.usedGB'),  {type:'number',role:'value',unit:'GB'});
+      await ensureState(idJoin(base,'size.freeGB'),  {type:'number',role:'value',unit:'GB'});
+
+      const fsType = v.fs_type || v.filesystem || v.fsType || '';
+
+      await safeSet(idJoin(base,'status'), v.status || v.health_status || v.stat || v.state || '');
+      await safeSet(idJoin(base,'fsType'), fsType);
+      await safeSet(idJoin(base,'size.totalGB'), totalGB);
+      await safeSet(idJoin(base,'size.usedGB'),  usedGB);
+      await safeSet(idJoin(base,'size.freeGB'),  freeGB);
+
+      volOut.push({
+        name,
+        status: v.status || '',
+        fsType,
+        totalGB,
+        usedGB,
+        freeGB
+      });
+    }
+
+    await ensureState(idJoin(rootStor,'volumesJson'), {type:'string',role:'json'});
+    await safeSet(idJoin(rootStor,'volumesJson'), J(volOut));
+    CACHE.volumes = volOut;
+  }catch(e){
+    say('warn',`fetchStorage.load_info: ${e}`);
+    await ensureState(idJoin(rootStor,'volumesJson'), {type:'string',role:'json'});
+    await safeSet(idJoin(rootStor,'volumesJson'),'[]');
+    CACHE.volumes = [];
+  }
+
+  let diskArr = [];
+  try{
+    const d = await callApi('SYNO.Core.Storage.Disk','list',{
+      offset:0,
+      limit:100,
+      additional:'health,temperature,ident,capacity'
+    });
+    diskArr = d?.disks || d || [];
+  }catch(e){
+    say('warn',`fetchStorage.disks: ${e}`);
+  }
+
+  const disksOut = [];
+  if (Array.isArray(diskArr) && diskArr.length){
+    for (const d of diskArr){
+      const nameRaw = d.device || d.id || d.disk_id || d.internal_name || d.slot || d.name || 'disk';
+      const name    = String(nameRaw);
+      const id      = idSafe(nameRaw);
+      const base    = idJoin(rootStor,'Disks', id);
+
+      await ensureState(idJoin(base,'model'),        {type:'string',role:'text'});
+      await ensureState(idJoin(base,'serial'),       {type:'string',role:'text'});
+      await ensureState(idJoin(base,'tempC'),        {type:'number',role:'value.temperature',unit:'°C'});
+      await ensureState(idJoin(base,'health'),       {type:'string',role:'text'});
+      await ensureState(idJoin(base,'sizeGB'),       {type:'number',role:'value',unit:'GB'});
+      await ensureState(idJoin(base,'utilPercent'),  {type:'number',role:'value.percent',unit:'%'});
+      await ensureState(idJoin(base,'rw.kBps.read'), {type:'number',role:'value',unit:'kB/s'});
+      await ensureState(idJoin(base,'rw.kBps.write'),{type:'number',role:'value',unit:'kB/s'});
+
+      const model  = d.model || d.brand_model || d.ident?.model || '';
+      const serial = d.serial || d.sn || d.ident?.serial || '';
+      const tempC  = num(d.temp ?? d.temperature ?? d.smart_temp);
+      const health = d.health || d.status || '';
+
+      let sizeMb = 0;
+      if (d.capacity && typeof d.capacity === 'object' && d.capacity.size_total != null){
+        sizeMb = num(d.capacity.size_total)/(1024*1024);
+      } else if (d.size_mb != null){
+        sizeMb = num(d.size_mb);
+      } else if (d.disk_size != null){
+        sizeMb = num(d.disk_size)/(1024*1024);
+      }
+      const sizeGB = mbToGb(sizeMb);
+
+      const util  = isFinite(num(d.util ?? d.utilization))
+        ? Math.max(0,Math.min(100,Math.round(num(d.util ?? d.utilization))))
+        : null;
+
+      if (model)  await safeSet(idJoin(base,'model'), model);
+      if (serial) await safeSet(idJoin(base,'serial'), serial);
+      if (isFinite(tempC)) await safeSet(idJoin(base,'tempC'), tempC);
+      if (health) await safeSet(idJoin(base,'health'), health);
+      if (isFinite(sizeGB) && sizeGB>0) await safeSet(idJoin(base,'sizeGB'), sizeGB);
+      if (util!=null) await safeSet(idJoin(base,'utilPercent'), util);
+
+      disksOut.push({
+        name,
+        model,
+        serial,
+        tempC: isFinite(tempC)?tempC:null,
+        health: health || '',
+        sizeGB: isFinite(sizeGB)?sizeGB:0,
+        utilPercent: util,
+        read_kBps: null,
+        write_kBps: null
+      });
+    }
+  }
+
+  await ensureState(idJoin(rootStor,'disksJson'), {type:'string',role:'json'});
+  await safeSet(idJoin(rootStor,'disksJson'), J(disksOut));
+  CACHE.disks = disksOut;
+}
+
+/*** === SESSIONS === ***/
+async function fetchSessions(){
+  if (!CFG.ENABLE.SESSIONS) return;
+  try{
+    let s={}; try{ s = await callApi('SYNO.Core.CurrentConnection','list'); }catch{}
+    const list = s.connections || s.items || [];
+    await ensureState(idJoin(CFG.ROOT,'Sessions.count'), {type:'number',role:'value'});
+    await ensureState(idJoin(CFG.ROOT,'Sessions.listJson'), {type:'string',role:'json'});
+    await safeSet(idJoin(CFG.ROOT,'Sessions.count'), list.length);
+    if (list.length) await safeSet(idJoin(CFG.ROOT,'Sessions.listJson'), J(list));
+  }catch(e){ say('warn',`fetchSessions: ${e}`); }
+}
+
+/*** === DOCKER === ***/
+async function fetchDocker(){
+  if (!CFG.ENABLE.DOCKER) return;
+  try{
+    const listResp = await callApi('SYNO.Docker.Container', 'list', {
+      type: 'all', offset: 0, limit: 1000, additional: 'detail,port,network,profile,resource'
+    });
+    const containers = listResp?.containers || listResp?.data?.containers || listResp || [];
+    if (!Array.isArray(containers)) return;
+
+    const resMap = {};
+    try {
+      const r = await callApi('SYNO.Docker.Container.Resource', 'get', {});
+      (r?.resources || r || []).forEach((it) => {
+        const key = (it.name || '').replace(/^\//, '');
+        if (key) resMap[key] = it;
+      });
+    } catch (e) { say('warn','Docker Resource.get: ' + (e.message || e)); }
+
+    const out=[];
+    for (const c of containers){
+      const name = (c.Name || c.name || (Array.isArray(c.Names) ? c.Names[0] : '') || '')
+        .replace(/^\//, '');
+      const image = c.Image || c.image || '';
+      const statusText = (c.status || c.State || '').toString().toLowerCase();
+      const running = /running/.test(statusText) || c.running === true || c.status === 'running';
+      let cpu=null, memMB=null;
+      const r = resMap[name];
+      if (r){
+        const cv=Number(r.cpu); if (isFinite(cv)) cpu=Math.max(0,Math.round(cv*100)/100);
+        const mv=Number(r.memory); if (isFinite(mv)) memMB=Math.round(mv/1024/1024);
+      }
+      const ports = Array.isArray(c.ports)
+        ? c.ports.map(p=>{
+            const pub=p.PublicPort||p.public||p.published;
+            const priv=p.PrivatePort||p.private||p.target;
+            const typ=p.Type||p.type||'';
+            if (pub&&priv) return `${pub}->${priv}/${typ}`;
+            if (priv) return `${priv}/${typ}`;
+            return '';
+          }).filter(Boolean).join(', ')
+        : '';
+
+      const base = idJoin(CFG.ROOT, 'Docker', 'Containers', name || (c.Id || c.ID || 'container'));
+      await ensureState(idJoin(base, 'status'), { type: 'string', role: 'text' });
+      await ensureState(idJoin(base, 'cpu'),    { type: 'number', role: 'value', unit: '%' });
+      await ensureState(idJoin(base, 'memMB'),  { type: 'number', role: 'value', unit: 'MB' });
+      await ensureState(idJoin(base, 'image'),  { type: 'string', role: 'text' });
+      await ensureState(idJoin(base, 'ports'),  { type: 'string', role: 'text' });
+      await ensureState(idJoin(base, 'control'),{ type: 'string', role: 'text', read:false, write:true });
+
+      await safeSet(idJoin(base, 'status'), running ? 'running' : (statusText || 'unknown'));
+      if (cpu!=null) await safeSet(idJoin(base, 'cpu'), cpu);
+      if (memMB!=null) await safeSet(idJoin(base, 'memMB'), memMB);
+      if (image) await safeSet(idJoin(base, 'image'), image);
+      if (ports) await safeSet(idJoin(base, 'ports'), ports);
+
+      out.push({ name, image, status: running ? 'running' : (statusText || 'unknown'), cpu, memMB, ports });
+    }
+    await ensureState(idJoin(CFG.ROOT, 'Docker.listJson'), { type: 'string', role: 'json' });
+    await safeSet(idJoin(CFG.ROOT, 'Docker.listJson'), JSON.stringify(out));
+    CACHE.docker = out;
+  }catch(e){ say('warn',`fetchDocker: ${e.message||e}`); }
+}
+
+/*** === VMM (Gäste + Stats) === ***/
+async function fetchVMM() {
+  if (!CFG.ENABLE.VMM) return;
+
+  try {
+    let vms = null;
+    let lastErr = null;
+
+    const trials = [
+      ['SYNO.Virtualization.Guest',      'list', { offset: 0, limit: 500, additional: 'status,resource,storage,host,tag' }],
+      ['SYNO.Virtualization.API.Guest',  'list', { offset: 0, limit: 500 }]
+    ];
+
+    for (const [api, method, params] of trials) {
+      try {
+        const r = await callApi(api, method, params);
+        vms = r;
+        if (vms) break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    if (!vms) {
+      const msg = String(lastErr || '');
+      if (msg.includes('"code":114')) {
+        say('warn', 'VMM: Rechteproblem (code 114) – DSM-Berechtigungen prüfen oder CFG.ENABLE.VMM=false setzen.');
+        return;
+      }
+      if (/Unknown API|SYNO\.Virtualization/i.test(msg)) {
+        say('warn', 'VMM: Virtualization-API nicht verfügbar (VMM evtl. nicht installiert?).');
+        return;
+      }
+      throw lastErr || new Error('VMM: keine Antwort von Virtualization-API');
+    }
+
+    const arr =
+      vms.vms             || vms.data?.vms   ||
+      vms.guests          || vms.data?.guests ||
+      vms.list            || vms.data?.list  ||
+      (Array.isArray(vms) ? vms : []);
+
+    const out = [];
+
+    for (const v of (Array.isArray(arr) ? arr : [])) {
+      const name = (v.name || v.vm_name || v.guest_name || v.id || v.guest_id || 'vm').toString();
+      let id     = v.id || v.uuid || v.guest_uuid || v.guest_id || v.vm_uuid || '';
+
+      let power  = (v.power_state || v.status || v.power || '').toString();
+
+      let cpuCount = num(v.vcpu ?? v.cpu ?? v.vcpu_number ?? v.vcpu_num);
+      let ramMB    = num(v.memory_mb ?? v.ram ?? v.memory_size ?? v.vram_size);
+
+      let disksList =
+        Array.isArray(v.disks)   ? v.disks :
+        Array.isArray(v.storage) ? v.storage :
+        Array.isArray(v.vdisks)  ? v.vdisks.map(d => ({
+          size: num(d.vdisk_size) * 1024 * 1024,
+          name: d.vdisk_id || 'disk'
+        })) :
+        [];
+
+      let cpuUsage  = null;
+      let ramUsedMB = null;
+
+      const detailTrials = [
+        ['SYNO.Virtualization.Guest',     'statistics', { id }],
+        ['SYNO.Virtualization.Guest',     'status',     { id }],
+        ['SYNO.Virtualization.Guest',     'get',        { id }],
+        ['SYNO.Virtualization.API.Guest', 'get',        { id }]
+      ];
+
+      for (const [api, m, params] of detailTrials) {
+        try {
+          const d = await callApi(api, m, params);
+          const g = d.vm || d.guest || d.info || d;
+
+          if (g) {
+            id       = id || g.id || g.uuid || g.guest_uuid;
+            cpuCount = cpuCount || num(g.vcpu ?? g.cpu ?? g.vcpu_number ?? g.vcpu_num);
+            ramMB    = ramMB    || num(g.memory_mb ?? g.ram ?? g.memory_size ?? g.vram_size);
+            power    = power    || g.power_state || g.status || g.power;
+
+            if ((!disksList || !disksList.length) && (g.disks || g.storage)) {
+              disksList = g.disks || g.storage;
+            }
+          }
+
+          const perf = d.perf || d.performance || d.statistics || d.stats;
+          if (perf) {
+            const cu = Number(perf.cpu?.percent ?? perf.cpu_usage ?? perf.cpu?.usage);
+            if (isFinite(cu)) {
+              cpuUsage = Math.max(0, Math.min(100, Math.round(cu)));
+            }
+            const ru = Number(perf.mem?.used ?? perf.memory_used ?? perf.mem_usage);
+            if (isFinite(ru)) {
+              ramUsedMB = Math.round(ru / 1024 / 1024);
+            }
+          }
+        } catch (_e) {
+          // ignore
+        }
+      }
+
+      let diskGBTotal = 0;
+      for (const d of (disksList || [])) {
+        const b = num(d.size ?? d.capacity ?? d.disk_size ?? d.vdisk_size);
+        if (b > 0) {
+          diskGBTotal += Math.round(b / 1024 / 1024 / 1024);
+        }
+      }
+
+      const V = idJoin(CFG.ROOT, 'VMM', 'VMs', name);
+
+      await ensureState(idJoin(V, 'id'),             { type:'string',  role:'text' });
+      await ensureState(idJoin(V, 'power'),          { type:'string',  role:'text' });
+      await ensureState(idJoin(V, 'cpu.vcpu'),       { type:'number',  role:'value',          unit:'vCPU' });
+      await ensureState(idJoin(V, 'cpu.usage'),      { type:'number',  role:'value.percent',  unit:'%' });
+      await ensureState(idJoin(V, 'ramMB.total'),    { type:'number',  role:'value',          unit:'MB' });
+      await ensureState(idJoin(V, 'ramMB.used'),     { type:'number',  role:'value',          unit:'MB' });
+      await ensureState(idJoin(V, 'diskGB.total'),   { type:'number',  role:'value',          unit:'GB' });
+      await ensureState(idJoin(V, 'disks'),          { type:'string',  role:'text' });
+      await ensureState(idJoin(V, 'powerCmd'),       { type:'string',  role:'text', read:false, write:true });
+
+      await safeSet(idJoin(V, 'id'), id || '');
+      if (power)                  await safeSet(idJoin(V, 'power'), power);
+      if (isFinite(cpuCount))     await safeSet(idJoin(V, 'cpu.vcpu'), cpuCount);
+      if (isFinite(ramMB))        await safeSet(idJoin(V, 'ramMB.total'), ramMB);
+      if (isFinite(diskGBTotal))  await safeSet(idJoin(V, 'diskGB.total'), diskGBTotal);
+      if (cpuUsage != null)       await safeSet(idJoin(V, 'cpu.usage'), cpuUsage);
+      if (ramUsedMB != null)      await safeSet(idJoin(V, 'ramMB.used'), ramUsedMB);
+      await safeSet(idJoin(V, 'disks'), J(disksList || []));
+
+      out.push({
+        name,
+        id: id || '',
+        power: power || '',
+        cpu_vcpu: cpuCount || 0,
+        cpu_usage: cpuUsage != null ? cpuUsage : null,
+        ramMB_total: ramMB || 0,
+        ramMB_used: ramUsedMB != null ? ramUsedMB : null,
+        diskGB_total: diskGBTotal || 0,
+        disks: disksList || []
+      });
+    }
+
+    await ensureState(idJoin(CFG.ROOT, 'VMM.listJson'), { type:'string', role:'json' });
+    await safeSet(idJoin(CFG.ROOT, 'VMM.listJson'), out.length ? J(out) : '[]');
+    CACHE.vmm = out;
+  } catch (e) {
+    say('warn', `fetchVMM: ${e}`);
+  }
+}
+
+/*** === SURVEILLANCE === ***/
+async function ssGetHomeMode(){
+  try{
+    const d = await callApi('SYNO.SurveillanceStation.HomeMode','GetInfo')
+      .catch(async()=>await callApi('SYNO.SurveillanceStation.HomeMode','getInfo'));
+    const enabled = !!(d.on ?? d.enabled ?? d.home_mode);
+    await ensureState(
+      idJoin(CFG.ROOT,'Surveillance.HomeMode.enabled'),
+      {type:'boolean',role:'switch',read:true,write:true}
+    );
+    await safeSet(idJoin(CFG.ROOT,'Surveillance.HomeMode.enabled'), enabled);
+  }catch(e){
+    if (CFG.DEBUG_API && !CFG.SILENT) log(`ssGetHomeMode: ${e}`,'warn');
+  }
+}
+
+// Effektive Surveillance-SID ermitteln (Sessions-Objekt oder Core-SID)
+function currentSurvSid() {
+  return (SESS.SurveillanceStation && SESS.SurveillanceStation.sid) || SID || '';
+}
+
+// wird für Tokens aktuell nicht genutzt, lassen wir trotzdem drin
+function currentSurvToken() {
+  return (SESS.SurveillanceStation && SESS.SurveillanceStation.token) || AUTH.token || '';
+}
+
+// Hilfsfunktion: alles nach "?ts=" abschneiden (Cache-Buster von Widgets)
+function stripTs(u){
+  if (!u) return '';
+  let s = String(u);
+  const i = s.indexOf('?ts=');
+  if (i > 0) s = s.slice(0, i);
+  return s;
+}
+
+// Snapshot-URLs für eine Kamera aufbauen
+function buildSnapshotUrls(camId){
+  const apInfo   = apiPath('SYNO.SurveillanceStation.Camera');
+  const basePath = normalizePath(apInfo.path || '/webapi/entry.cgi');
+  const v        = apInfo.ver || 9;
+  const ts       = Date.now();
+
+  // 1. SURV_SID (dedizierter Snapshot-Login)
+  // 2. Fallback: SurveillanceStation/Core-SID
+  const effSid = SURV_SID || currentSurvSid();
+
+  const params = {
+    api    : 'SYNO.SurveillanceStation.Camera',
+    method : 'GetSnapshot',
+    version: v,
+    cameraId: camId,
+    id     : camId,
+    _dc    : ts
+  };
+  if (effSid) params._sid = effSid;
+
+  const apiUrl = `${BASE}${basePath}?${enc(params)}`;
+  const visUrl = toVisHttp(apiUrl);   // HTTP + Port-Mapping (5551 → 5550 etc.)
+
+  return {
+    api: stripTs(apiUrl),             // interne API-URL
+    vis: stripTs(visUrl)              // VIS-Variante (für Browser/MinuVis)
+  };
+}
+
+function cleanInputName(v){
+  let s=String(v||'').trim();
+  s = s.replace(/^["']+|["']+$/g,'').trim();
+  s = s.replace(/^(snap|snapshot|discord)\s+/i,'').trim();
+  s = s.replace(/\s{2,}/g,' ');
+  return s;
+}
+
+async function ssListCameras(){
+  try{
+    let cams = await callApi(
+      'SYNO.SurveillanceStation.Camera','List',
+      { additional:'device,stream' }
+    ).catch(async()=>await callApi(
+      'SYNO.SurveillanceStation.Camera','list',
+      {additional:'device,stream'}
+    ));
+
+    const arr = cams.cameras || cams.data || cams || [];
+    if (!Array.isArray(arr)) return;
+
+    const camOut = [];
+
+    for (const c of arr){
+      const camId = (c.id ?? c.cameraId ?? c.deviceId ?? c.source_id);
+      if (camId == null) continue;
+
+      const camTitle = (
+        c.name ||
+        c.newName ||
+        c.devName ||
+        c.device?.camName ||
+        c.hostname ||
+        `cam_${camId}`
+      );
+      const key       = idSafe(camTitle);
+      // ALT:
+// const enabled   = yes(c.enabled ?? c.enable ?? c.camera_enabled);
+
+// NEU (robust):
+function camEnabled(c){
+  const cand = [
+    c.enabled, c.enable, c.camera_enabled,
+    c.isEnable, c.is_enabled, c.is_enable, c.newEnable,
+    c.device && (c.device.enabled ?? c.device.enable),
+    c.status, c.state
+  ];
+  for (const v of cand) {
+    // harte Treffer
+    if (v === true || v === 1 || v === '1') return true;
+    if (typeof v === 'string') {
+      const s = v.toLowerCase();
+      if (/(^|[^a-z])on([^a-z]|$)/.test(s)) return true;        // "on"
+      if (/(^|[^a-z])enabled?([^a-z]|$)/.test(s)) return true;  // "enable"/"enabled"
+      if (/normal|ok|ready/.test(s) && !/disable|off/.test(s)) return true;
+      if (/disable|off/.test(s)) return false;
+    }
+    if (v === false || v === 0 || v === '0') return false;
+  }
+  // Fallback: wenn nichts klar negiert → lieber "true"
+  return true;
+}
+
+const enabled = camEnabled(c);
+
+    const connected =
+  yes(c.connection?.connected) ||
+  Number(c.status) === 1 ||
+  /connect|normal|ok|ready|live|link/i.test(String(c.connection?.status || c.statusTxt || c.state || '')) ||
+  yes(c.live);
+
+
+      const rec       = yes(c.recording ?? c.isRecording ?? (c.recStatus===1));
+      const recStatus = (c.recStatusText || (rec?'recording':'idle'))+'';
+
+      const snaps = buildSnapshotUrls(camId);
+
+      const C = idJoin(CFG.ROOT,'Surveillance','Cameras', key);
+      await ensureState(idJoin(C,'title'),          {type:'string', role:'text'});
+      await ensureState(idJoin(C,'id'),             {type:'number', role:'value'});
+      await ensureState(idJoin(C,'enabled'),        {type:'boolean',role:'indicator'});
+      await ensureState(idJoin(C,'connected'),      {type:'boolean',role:'indicator.reachable'});
+      await ensureState(idJoin(C,'recording'),      {type:'boolean',role:'indicator'});
+      await ensureState(idJoin(C,'recStatus'),      {type:'string', role:'text'});
+      await ensureState(idJoin(C,'lastEventTs'),    {type:'number', role:'value.time'});
+      await ensureState(idJoin(C,'snapshotUrl'),    {type:'string', role:'url'});
+      await ensureState(idJoin(C,'snapshotUrlAlt'), {type:'string', role:'url'});
+      await ensureState(idJoin(C,'snapshotUrlAlt2'),{type:'string', role:'url'});
+      await ensureState(idJoin(C,'snapshotUrlVis'), {type:'string', role:'url'});
+      await ensureState(idJoin(C,'liveviewUrl'),    {type:'string', role:'url'});
+      await ensureState(idJoin(C,'control'),        {type:'string', role:'text', read:false, write:true});
+      await ensureState(idJoin(C,'snapshotDataUri'),{type:'string', role:'url'});
+
+
+      await safeSet(idJoin(C,'title'),     camTitle);
+      await safeSet(idJoin(C,'id'),        Number(camId)||0);
+      await safeSet(idJoin(C,'enabled'),   enabled);
+      await safeSet(idJoin(C,'connected'), connected);
+      await safeSet(idJoin(C,'recording'), rec);
+      await safeSet(idJoin(C,'recStatus'), recStatus);
+
+      // WICHTIG: Nur Strings in die States schreiben
+      await safeSet(idJoin(C,'snapshotUrl'),     snaps.api);
+      await safeSet(idJoin(C,'snapshotUrlAlt'),  snaps.api);
+      await safeSet(idJoin(C,'snapshotUrlAlt2'), snaps.api);
+      await safeSet(idJoin(C,'snapshotUrlVis'),  snaps.vis);
+
+      camOut.push({
+        key,
+        title: camTitle,
+        id:    Number(camId)||0,
+        enabled,
+        connected,
+        recording: rec,
+        recStatus,
+        lastEventTs: 0,
+        snapshotUrl:    snaps.api,
+        snapshotUrlAlt: snaps.api,
+        snapshotUrlAlt2:snaps.api,
+        snapshotUrlVis: snaps.vis,
+        liveviewUrl: ''
+      });
+    }
+
+    if (camOut.length){
+      CACHE.cams = camOut;
+      await ensureState(
+        idJoin(CFG.ROOT,'Surveillance.Cameras.listJson'),
+        {type:'string',role:'json'}
+      );
+      await safeSet(
+        idJoin(CFG.ROOT,'Surveillance.Cameras.listJson'),
+        J(camOut)
+      );
+    }
+  }catch(e){
+    say('warn',`ssListCameras: ${e}`);
+  }
+}
+
+/*** === SNAPSHOT → FILE / DISCORD (optional) === ***/
+function writeFileP(adapter, file, data, mime) {
+  return new Promise((res, rej) => {
+    try {
+      // JS 9.x → writeFileAsync bevorzugen (ohne options)
+      if (typeof writeFileAsync === 'function') {
+        writeFileAsync(adapter, file, data)
+          .then(() => res())
+          .catch(rej);
+      } else if (typeof writeFile === 'function') {
+        // ältere JS-Versionen
+        writeFile(adapter, file, data, err => err ? rej(err) : res());
+      } else {
+        rej(new Error('writeFile*/writeFileAsync nicht verfügbar'));
+      }
+    } catch (e) {
+      rej(e);
+    }
+  });
+}
+
+
+async function saveSnapshotToFiles(camTitle, url){
+  const DBGROOT = idJoin(CFG.ROOT,'Surveillance.Debug');
+  await ensureState(idJoin(DBGROOT,'lastSnapshotUrl'), {type:'string',role:'text'});
+  await ensureState(idJoin(DBGROOT,'lastFilePath'),   {type:'string',role:'text'});
+  await ensureState(idJoin(DBGROOT,'lastFileUrl'),    {type:'string',role:'text'});
+  await ensureState(idJoin(DBGROOT,'lastError'),      {type:'string',role:'text'});
+
+  // URL bereinigt (ohne "?ts=...")
+  const u = stripTs(String(url || ''));
+  if (!u){
+    await safeSet(idJoin(DBGROOT,'lastError'),`Snapshot-URL leer (${camTitle})`);
+    throw new Error('Snapshot-URL leer');
+  }
+  await safeSet(idJoin(DBGROOT,'lastSnapshotUrl'), u);
+
+  const {buf,contentType,status} = await fetchBinaryWithType(u);
+  if (status!==200 || !buf || !buf.length)
+    throw new Error(`Snapshot HTTP ${status||0}`);
+
+  const safe = idSafe(camTitle);
+  const ext  = /png/i.test(contentType) ? 'png' : 'jpg';
+  const fname= `${safe}-${new Date().toISOString().replace(/[:.]/g,'-')}.${ext}`;
+
+  const adapter = CFG.IOB_FILES_ADAPTER;
+  let filePath='', usedDir='';
+  let lastErr=null;
+
+  try{
+    if (typeof writeFile === 'function' || typeof writeFileAsync === 'function'){
+      for (const dir of (CFG.IOB_FILES_DIRS||['/screenshots'])){
+        const dirA = (dir||'').replace(/\/+$/,'') || '/';
+        const dirB = dirA.replace(/^\/+/,'');
+        for (const p of [`${dirA}/${fname}`, `${dirB}/${fname}`]){
+          try{
+            await writeFileP(adapter,p,buf,contentType||'image/jpeg');
+            filePath=p; usedDir=dirA; break;
+          }catch(e){ lastErr=e; }
+        }
+        if (filePath) break;
+      }
+      if (!filePath){
+        for (const p of [`/${fname}`, fname]){
+          try{
+            await writeFileP(adapter,p,buf,contentType||'image/jpeg');
+            filePath=p; usedDir='/'; break;
+          }catch(e){ lastErr=e; }
+        }
+      }
+    } else {
+      lastErr = new Error('writeFile not available in JS9');
+    }
+  }catch(e){ lastErr=e; }
+
+  if (!filePath){
+    await safeSet(idJoin(DBGROOT,'lastError'), String(lastErr||'writeFile failed'));
+    throw lastErr||new Error('writeFile failed');
+  }
+
+  const publicPath = filePath.replace(/^\/+/,'');
+  const fileUrl = `${CFG.IOB_FILES_BASE}/${adapter}/${publicPath}`;
+
+  await safeSet(idJoin(DBGROOT,'lastFilePath'), filePath);
+  await safeSet(idJoin(DBGROOT,'lastFileUrl'),  fileUrl);
+  await safeSet(idJoin(DBGROOT,'lastError'),    '');
+  return { fileUrl, filePath, usedDir, adapter };
+}
+
+
+function scheduleSnapshotDelete(adapter, filePath){
+  try{
+    if (!CFG.SNAP_DELETE_MS || CFG.SNAP_DELETE_MS <= 0) return;
+    const fsPathRel = String(filePath || '').replace(/^\/+/, ''); // "screenshots/<file>"
+    setTimeout(()=>{
+      try{
+        if (typeof delFileAsync === 'function'){
+          delFileAsync(adapter, fsPathRel)
+            .then(()=>{ if (!CFG.SILENT) log(`Snapshot gelöscht: ${adapter}/${fsPathRel}`,'info'); })
+            .catch(e=> say('warn',`Snapshot delete error (${adapter}/${fsPathRel}): ${e}`));
+        } else if (typeof delFile === 'function'){
+          delFile(adapter, fsPathRel, (err)=>{
+            if (err) say('warn',`Snapshot delete error (${adapter}/${fsPathRel}): ${err}`);
+            else if (!CFG.SILENT) log(`Snapshot gelöscht: ${adapter}/${fsPathRel}`,'info');
+          });
+        } else {
+          say('warn','Snapshot delete: delFile*/delFileAsync nicht verfügbar');
+        }
+      }catch(e){
+        say('warn',`Snapshot delete exception: ${e}`);
+      }
+    }, CFG.SNAP_DELETE_MS);
+  } catch(e){
+    say('warn',`scheduleSnapshotDelete(): ${e}`);
+  }
+}
+
+async function lookupCamByInput(input){
+  let name = cleanInputName(input);
+  if (!name) return null;
+  let list = [];
+  try{ list = JSON.parse(await safeGet(idJoin(CFG.ROOT,'Surveillance.Cameras.listJson'), '[]')); }catch{}
+  if (!Array.isArray(list) || !list.length){
+    await ssListCameras();
+    try{ list = JSON.parse(await safeGet(idJoin(CFG.ROOT,'Surveillance.Cameras.listJson'), '[]')); }catch{}
+  }
+  if (!Array.isArray(list) || !list.length) return null;
+
+  const lc=name.toLowerCase();
+  return list.find(c=> (c.key||'').toLowerCase()===lc)
+      ||  list.find(c=> (c.title||'').toLowerCase()===lc)
+      ||  list.find(c=> (c.title||'').toLowerCase().startsWith(lc))
+      ||  list.find(c=> (c.key||'').toLowerCase().startsWith(lc))
+      ||  list.find(c=> (c.title||'').toLowerCase().includes(lc))
+      ||  list.find(c=> (c.key||'').toLowerCase().includes(lc))
+      ||  null;
+}
+
+async function getSnapshotUrlFor(cam){
+  const baseNew = idJoin(CFG.ROOT,'Surveillance','Cameras', cam.key);
+  let url = await safeGet(baseNew+'.snapshotUrl','')
+         || await safeGet(baseNew+'.snapshotUrlAlt','')
+         || await safeGet(baseNew+'.snapshotUrlAlt2','');
+
+  url = stripTs(url);
+
+  if (url) return url;
+
+  // Fallback: frisch erzeugte URL mit aktuellem SID
+  const snaps = buildSnapshotUrls(cam.id);
+  return snaps.api;
+}
+
+async function discordSendFileOnce({fileUrl, filePath, adapter}) {
+  try {
+    const fsPathRel = String(filePath || '').replace(/^\/+/, '');                // z.B. "screenshots/xxx.jpg"
+    const iobRel    = `${adapter}/${fsPathRel}`;                                 // "0_userdata.0/screenshots/xxx.jpg"
+    const iobAbs    = `/${iobRel}`;                                              // "/0_userdata.0/screenshots/xxx.jpg"
+
+    let payload;
+    if (CFG_SEND_FILE_MODE === 'http') {
+      payload = fileUrl;
+    } else if (CFG_SEND_FILE_MODE === 'abs') {
+      payload = iobAbs;
+    } else { // 'rel' (Standard & dein bewährter Weg)
+      payload = iobRel;
+    }
+
+    await setStateAsync(CFG.DISCORD_SEND_FILE, payload, false);
+    if (!CFG.SILENT) log(`[Discord] sendFile (${CFG_SEND_FILE_MODE}) → ${payload}`,'info');
+
+    if (CFG_SEND_TEXT_WITH_URL) {
+      try { await setStateAsync(CFG.DISCORD_SEND_TEXT, fileUrl, false); } catch(_) {}
+    }
+  } catch (e) {
+    say('warn', `Discord sendFile Fehler: ${e}`);
+  }
+}
+
+
+
+async function sendSnapshotToDiscord(camInput){
+  const cam = await lookupCamByInput(camInput);
+  if (!cam){ throw new Error(`Keine Kamera gefunden für "${camInput}"`); }
+  const url = await getSnapshotUrlFor(cam);
+  if (!url){ throw new Error(`Keine Snapshot-URL für "${cam.title}" gefunden`); }
+  const saved = await saveSnapshotToFiles(cam.title, url);
+  // kurze Wartezeit, damit der Web-Adapter / File-Index die Datei sicher bereitstellt
+  await new Promise(r => setTimeout(r, 800));
+  let ok = false;
+try {
+  for (let i = 0; i < 8; i++) {
+    ok = await probeUrl(saved.fileUrl, 3000);
+    if (ok) break;
+    await new Promise(r => setTimeout(r, 400 + i * 250));
+  }
+} catch (e) {
+  // jeder Fehler beim Probing ist unkritisch – wir senden trotzdem
+  say('warn', `Probe-Fehler ignoriert: ${e}`);
+}
+if (!ok) say('warn', `File-URL noch nicht erreichbar: ${saved.fileUrl} – schicke trotzdem an Router`);
+await discordSendFileOnce(saved);
+scheduleSnapshotDelete(saved.adapter, saved.filePath);
+  
+  if (!CFG.SILENT) log(`[Snapshot→Discord] ${cam.title} → ${saved.fileUrl}`,'info');
+}
+
+// Snapshot -> data:image/...;base64,... im State .snapshotDataUri
+// Snapshot -> data:image/...;base64,... im State .snapshotDataUri + Datei + snapshotFileUrl
+async function buildSnapshotDataUriForKey(key) {
+  try {
+    const k = String(key || '').trim();
+    if (!k) return;
+
+    const base = idJoin(CFG.ROOT, 'Surveillance', 'Cameras', k);
+
+    // Kamera-Flags nur noch zu Diagnose-Zwecken, nicht blockierend
+    const enabled   = await safeGet(base + '.enabled',   null);
+    const connected = await safeGet(base + '.connected', null);
+
+    if (enabled === false || connected === false) {
+      say(
+        'info',
+        'snapshotDataUri(' + k + '): enabled=' + enabled + ', connected=' + connected + ' – versuche trotzdem Snapshot'
+      );
+    }
+
+    // Beste Snapshot-URL ermitteln (Vis bevorzugt)
+    let snapUrl = await safeGet(base + '.snapshotUrlVis', '');
+    if (!snapUrl) {
+      snapUrl =
+        await safeGet(base + '.snapshotUrl', '') ||
+        await safeGet(base + '.snapshotUrlAlt', '') ||
+        await safeGet(base + '.snapshotUrlAlt2', '');
+    }
+    if (!snapUrl) {
+      say('warn', 'snapshotDataUri(' + k + '): keine Snapshot-URL gefunden');
+      return;
+    }
+
+    // Nur eventuelles ?ts= abschneiden, _sid & _dc bleiben
+    const cleanUrl = stripTs(snapUrl);
+
+    const r = await fetchBinaryWithType(cleanUrl);
+    const buf         = r.buf;
+    const contentType = r.contentType || '';
+    const status      = r.status || 0;
+
+    if (status !== 200 || !buf || !buf.length) {
+      say('warn', 'snapshotDataUri(' + k + '): HTTP ' + status + ' / keine Daten');
+      return;
+    }
+
+    const ctLower = contentType.toLowerCase();
+    if (ctLower && ctLower.indexOf('image/') !== 0) {
+      say('warn', 'snapshotDataUri(' + k + '): kein Bild-Content-Type (' + contentType + ')');
+      return;
+    }
+
+    const mime = (ctLower && ctLower.indexOf('image/') === 0)
+      ? ctLower.split(';')[0]
+      : 'image/jpeg';
+
+    // 1) Data-URI in den State schreiben
+    const b64 = buf.toString('base64');
+    const dataUri = 'data:' + mime + ';base64,' + b64;
+
+    await ensureState(base + '.snapshotDataUri', { type: 'string', role: 'url' });
+    await safeSet(base + '.snapshotDataUri', dataUri);
+
+    // 2) Zusätzlich: Snapshot als Datei im ioBroker-Filesystem ablegen (wenn konfiguriert)
+    const exportDir = CFG.SURV_DATAURI && CFG.SURV_DATAURI.FILE_EXPORT_BASEDIR;
+    if (!exportDir) {
+      // kein Export-Verzeichnis -> DataURI reicht
+      return;
+    }
+
+    const adapter = CFG.IOB_FILES_ADAPTER || '0_userdata.0';
+    const dir = String(exportDir || '/').replace(/\/+$/, '');  // trailing "/" weg
+    const safeKey = idSafe(k);
+    const ext = mime.indexOf('png') !== -1 ? 'png' : 'jpg';
+
+    const filePath = dir + '/' + safeKey + '-live.' + ext;
+
+    try {
+      say('info', 'snapshotFileUrl(' + k + '): schreibe ' + adapter + ':' + filePath);
+      await writeFileP(adapter, filePath, buf, mime);
+    } catch (e2) {
+      say('warn', 'snapshotFileUrl(' + k + '): Fehler beim writeFile: ' + e2);
+      // wir versuchen trotzdem, eine URL zu bauen – evtl. war der Fehler nicht fatal
+    }
+
+    const publicPath = filePath.replace(/^\/+/, '');
+    const baseUrl =
+      CFG.IOB_FILES_BASE ||
+      ('http://' + (CFG.VIS_HTTP && CFG.VIS_HTTP.HOST ? CFG.VIS_HTTP.HOST : '10.1.1.2') + ':8081/files');
+    const fileUrl = baseUrl + '/' + adapter + '/' + publicPath;
+
+    await ensureState(base + '.snapshotFileUrl', { type: 'string', role: 'url' });
+    await safeSet(base + '.snapshotFileUrl', fileUrl);
+
+    say('info', 'snapshotFileUrl(' + k + '): OK -> ' + fileUrl);
+
+  } catch (e) {
+    say('warn', 'snapshotDataUri(' + key + '): ' + e);
+  }
+}
+
+
+
+
+// Camera control listener
+on({
+  id: new RegExp('^'+CFG.ROOT.replace(/\./g,'\\.')+'\\.Surveillance\\.Cameras\\.[^.]+\\.control$'),
+  change:'ne'
+}, async (obj)=>{
+  try{
+    const parts = obj.id.split('.');
+    const key = parts[parts.length-2];
+    const cmd = String(obj.state?.val||'').trim();
+    if (!cmd) return;
+
+    if (/^(discord|snapshot|snap)\b/i.test(cmd) || cmd==='1'){
+      await sendSnapshotToDiscord(key);
+    } else if (/^say\s+/i.test(cmd)){
+      // FIX: kein Objekt mehr in den Text-State schreiben
+      const msg = cmd.replace(/^say\s+/i,'');
+      await setStateAsync(CFG.DISCORD_SEND_TEXT, msg, false);
+    }
+  }catch(e){
+    say('warn',`Cam control handler: ${e}`);
+  } finally {
+    await safeSet(obj.id,'');
+  }
+});
+
+
+async function refreshDataUriSnapshots(force) {
+  if (!CFG.SURV_DATAURI || !CFG.SURV_DATAURI.ENABLED) {
+    return;
+  }
+
+  // Kamera-Liste: erst SURV_DATAURI.CAM_KEYS, sonst SURV_MINI_HTML.CAM_KEYS
+  let cams = [];
+  if (Array.isArray(CFG.SURV_DATAURI.CAM_KEYS) && CFG.SURV_DATAURI.CAM_KEYS.length) {
+    cams = CFG.SURV_DATAURI.CAM_KEYS;
+  } else if (Array.isArray(SURV_MINI_HTML.CAM_KEYS) && SURV_MINI_HTML.CAM_KEYS.length) {
+    cams = SURV_MINI_HTML.CAM_KEYS;
+  }
+  if (!cams.length) return;
+
+  const now = Date.now();
+  const minInt = CFG.SURV_DATAURI.MIN_INTERVAL_MS || CFG.POLL_MS || 30000;
+  if (!force && now - LAST_SURV_DATAURI < minInt) return;
+  LAST_SURV_DATAURI = now;
+
+  // Debug: zeigen, welche Kameras bearbeitet werden und welches Export-Verzeichnis genutzt wird
+  say(
+    'info',
+    'refreshDataUriSnapshots(force=' + force + '): '
+      + cams.join(', ')
+      + ' | FILE_EXPORT_BASEDIR=' + (CFG.SURV_DATAURI.FILE_EXPORT_BASEDIR || 'none')
+  );
+
+  for (const key of cams) {
+    await buildSnapshotDataUriForKey(key);
+  }
+}
+
+
+
+
+
+/*** === DASHBOARDS === ***/
+function esc(s){
+  return (s+'').replace(/[&<>"']/g,m=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[m]));
+}
+const ICON = {
+  syno:'🧊', cpu:'🖥️', mem:'🧠', load:'📈',
+  up:'⬆️', down:'⬇️', net:'🌐', disk:'💽',
+  vol:'🗄️', docker:'🐳', vm:'🖳', cam:'📷',
+  ok:'🟢', bad:'🔴', warn:'🟡', info:'🔷',
+  user:'👤', clock:'🕒', temp:'🌡️', ntp:'⏱️',
+  psu:'🔌', fw:'🧩'
+};
+const CSS = `
+:root{
+  --bg:#0b1120; --card:#111827; --text:#eef2ff; --muted:#b6c2d9;
+  --accent:#22d3ee; --accent2:#60a5fa; --rad:14px; --gap:12px;
+  --border:#253046; --shadow:0 10px 24px rgba(0,0,0,.35);
+  --thumbMaxH:180px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800}
+.brand-logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:var(--shadow)}
+.brand-title{font-size:16px}
+.brand small{color:var(--muted);font-weight:600;display:block;margin-top:1px;font-size:12px}
+.pill{padding:5px 10px;border-radius:999px;background:#0f172a;color:#d1d9e6;border:1px solid var(--border);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:var(--gap);padding:0 12px 20px}
+@media(max-width:1200px){.grid{grid-template-columns:repeat(8,minmax(0,1fr))}}
+@media(max-width:900px){.grid{grid-template-columns:repeat(6,minmax(0,1fr))}}
+@media(max-width:700px){.grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.span-6{grid-column:span 6}
+.span-8{grid-column:span 8}
+.span-12{grid-column:span 12}
+@media(max-width:900px){.span-6,.span-8{grid-column:span 12}}
+.card{
+  background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.03));
+  border:1px solid var(--border);border-radius:var(--rad);padding:12px;box-shadow:var(--shadow);overflow:hidden
+}
+.card h3{margin:0 0 8px 0;font-size:15px;color:#e2e8f0;font-weight:900;display:flex;gap:10px;align-items:center;justify-content:space-between}
+.value{font-weight:950;font-size:28px;display:flex;gap:6px;align-items:baseline}
+.sub{color:var(--muted);font-size:12px}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.badge{padding:2px 8px;border-radius:8px;border:1px solid var(--border);font-size:12px;display:inline-flex;align-items:center;gap:6px}
+.badge.green{background:#0f2a1d;border-color:#1d4d33;color:#b9f6d0}
+.badge.red{background:#2a1216;border-color:#6b2732;color:#fecaca}
+.badge.yellow{background:#2a2410;border-color:#6b5a22;color:#fde68a}
+.badge.blue{background:#0f1628;border-color:#2a3957;color:#dce9ff}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot.ok{background:#26d07c}.dot.bad{background:#ff6b6b}.dot.wrn{background:#f6c34a}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px}
+.progress{width:100%;height:10px;background:#0b1222;border-radius:999px;overflow:hidden;border:1px solid var(--border)}
+.progress .bar{height:100%;display:block;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.small{font-size:12px;color:#c7d2fe}
+.iface{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px dashed var(--border)}
+.iface:last-child{border-bottom:none}
+.camgrid{display:grid;grid-template-columns:repeat(4,minmax(210px,1fr));gap:12px}
+@media(max-width:1300px){.camgrid{grid-template-columns:repeat(3,minmax(210px,1fr))}}
+@media(max-width:900px){.camgrid{grid-template-columns:repeat(2,minmax(180px,1fr))}}
+@media(max-width:600px){.camgrid{grid-template-columns:1fr}}
+.cambadge{display:flex;flex-direction:column;gap:8px;background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:10px}
+.cam-title{font-weight:800;color:#f1f5ff;font-size:13px;line-height:1.25;white-space:normal}
+.cam-tags{display:flex;flex-wrap:wrap;gap:6px}
+.survgrid{display:grid;grid-template-columns:repeat(4,minmax(240px,1fr));gap:12px}
+@media(max-width:1400px){.survgrid{grid-template-columns:repeat(3,minmax(220px,1fr))}}
+@media(max-width:1000px){.survgrid{grid-template-columns:repeat(2,minmax(200px,1fr))}}
+@media(max-width:640px){.survgrid{grid-template-columns:1fr}}
+.camcard{display:flex;flex-direction:column;gap:8px;background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:10px}
+.cam-title{font-weight:800;color:#f1f5ff;font-size:13px;line-height:1.25;margin-bottom:2px}
+.cam-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
+.camimg{width:100%;aspect-ratio:16/9;max-height:var(--thumbMaxH);object-fit:cover;border-radius:10px;border:1px solid #243047}
+.sys-card .value { font-size: 22px; }
+.sys-card .value .sub { font-size: 13px; opacity: .95; }
+.lead { font-size: 13px; font-weight: 800; }
+.kv.compact { display: grid;grid-template-columns: auto 1fr;gap: 4px 10px; }
+.kv.compact dt { color: var(--muted);font-weight: 700; }
+.kv.compact dd { margin: 0; }
+.progress.slim { height: 8px; }
+.badge.chip { padding: 2px 8px;border-radius: 8px;border: 1px solid var(--border);background: rgba(255,255,255,.04);font-weight: 700; }
+@media (max-width: 600px){
+  .grid{ grid-template-columns: 1fr !important;gap: 10px;padding: 0 8px 14px; }
+  .card{ grid-column: 1 / -1 !important;padding: 10px; }
+  .sys-card .value{ font-size: 18px; }
+  .sys-card .value .sub{ font-size: 12.5px; }
+  .lead{ font-size: 12.5px; }
+  .small{ font-size: 12.5px; }
+  .progress.slim{ height: 7px; }
+  .badge{ font-size: 11px; padding: 2px 6px; }
+  .kv{ gap: 4px 8px; }
+  .kv.compact dt{ min-width: 92px; }
+  .iface{ flex-direction: column; align-items: flex-start; gap: 4px; }
+  .mono{ overflow-wrap: anywhere; }
+  .camgrid{ grid-template-columns: 1fr !important; }
+  .survgrid{ grid-template-columns: 1fr !important; }
+  .camimg{ aspect-ratio: 16/9; height: auto; }
+}
+@media (min-width: 601px) and (max-width: 900px){
+  .grid{ grid-template-columns: repeat(2, 1fr) !important; }
+  .card{ grid-column: 1 / -1; }
+  .camgrid{ grid-template-columns: repeat(2, 1fr); }
+  .survgrid{ grid-template-columns: repeat(2, 1fr); }
+}
+`;
+const FRAME =
+'<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>{{TITLE}}</title><style>'
++ CSS +
+'</style></head><body><header><div class="brand"><div class="brand-logo"></div><div class="brand-title">{{TITLE}}<br><small>Server-seitig gerendert</small></div></div><div><span class="pill">'
++ ICON.clock +
+' {{STAMP}}</span></div></header><main class="grid">{{BODY}}</main><footer>ioBroker · Default-1 Theme · {{STAMP}}</footer></body></html>';
+
+function fmtPct(x){ if (x==null || !isFinite(x)) return '–'; return `${Math.round(num(x))}%`; }
+
+async function renderMain(){
+  try{
+    const root = CFG.ROOT;
+
+    const model        = await safeGet(idJoin(root,'Info.model'), '');
+    const dsmVersion   = await safeGet(idJoin(root,'Info.dsmVersion'), '');
+    const uptimeHuman  = await safeGet(idJoin(root,'Info.uptimeHuman'), '–');
+
+    const cpuT  = num(await safeGet(idJoin(root,'Utilization.cpu.total'), 0));
+    const cpuU  = num(await safeGet(idJoin(root,'Utilization.cpu.user'), 0));
+    const cpuS  = num(await safeGet(idJoin(root,'Utilization.cpu.system'), 0));
+    const cpuW  = num(await safeGet(idJoin(root,'Utilization.cpu.wait'), 0));
+    const load1 = await safeGet(idJoin(root,'Utilization.load.1min'), 0);
+
+    const memU  = num(await safeGet(idJoin(root,'Utilization.memory.usedMB'), 0));
+    const memS  = num(await safeGet(idJoin(root,'Utilization.memory.sizeMB'), 0));
+    const memPct = (memS>0) ? Math.max(0,Math.min(100,Math.round((memU/memS)*100))) : 0;
+
+    const temp   = await safeGet(idJoin(root,'Info.sys.temperature'), null);
+    const twarn  = await safeGet(idJoin(root,'Info.sys.temperatureWarn'), false);
+    const fam    = await safeGet(idJoin(root,'Info.cpu.family'),'');
+    const ser    = await safeGet(idJoin(root,'Info.cpu.series'),'');
+    const ven    = await safeGet(idJoin(root,'Info.cpu.vendor'),'');
+    const clk    = await safeGet(idJoin(root,'Info.cpu.clockMHz'), null);
+    const cores  = await safeGet(idJoin(root,'Info.cpu.cores'), null);
+    const ntpe   = await safeGet(idJoin(root,'Info.ntp.enabled'), null);
+    const ntps   = await safeGet(idJoin(root,'Info.ntp.server'), '');
+    const rp1    = await safeGet(idJoin(root,'Info.psu.rp1.present'), null);
+    const rp2    = await safeGet(idJoin(root,'Info.psu.rp2.present'), null);
+    const rps    = await safeGet(idJoin(root,'Info.psu.supportRedundant'), null);
+    const fwv    = await safeGet(idJoin(root,'Info.firmware.version'), '');
+    const fwd    = await safeGet(idJoin(root,'Info.firmware.date'), '');
+
+    let ifs   = []; try{ ifs   = JSON.parse(await safeGet(idJoin(root,'Network.listJson'), '[]')); }catch{}
+    let vols  = []; try{ vols  = JSON.parse(await safeGet(idJoin(root,'Storage.volumesJson'), '[]')); }catch{}
+    let disks = []; try{ disks = JSON.parse(await safeGet(idJoin(root,'Storage.disksJson'), '[]')); }catch{}
+    let docks = []; try{ docks = JSON.parse(await safeGet(idJoin(root,'Docker.listJson'), '[]')); }catch{}
+    let vms   = []; try{ vms   = JSON.parse(await safeGet(idJoin(root,'VMM.listJson'), '[]')); }catch{}
+    let sess  = []; try{ sess  = JSON.parse(await safeGet(idJoin(root,'Sessions.listJson'), '[]')); }catch{}
+    let cams  = []; try{ cams  = JSON.parse(await safeGet(idJoin(root,'Surveillance.Cameras.listJson'), '[]')); }catch{}
+
+    const camName = (c) => String(
+      c?.title || c?.name || c?.dispName || c?.devName || c?.hostname || c?.key || ''
+    );
+    cams.sort((a,b)=>camName(a).localeCompare(camName(b),'de',{sensitivity:'base'}));
+
+    const cardSystem = `
+<div class="card sys-card" style="grid-column: span 6">
+  <h3>${ICON.syno} Synology</h3>
+  <div class="row" style="align-items:center;justify-content:space-between">
+    <div class="value">${fmtPct(cpuT)} <span class="sub">${ICON.cpu} CPU</span></div>
+    <div class="lead">${ICON.mem} RAM <b>${esc(memU)}/${esc(memS)}</b> MB</div>
+  </div>
+  <div class="progress slim" title="RAM">
+    <span class="bar" style="width:${memPct}%"></span>
+  </div>
+  <div class="kv compact small" style="margin-top:8px">
+    <dt>${ICON.load} Load (1m)</dt>
+    <dd><b>${esc(load1||0)}</b></dd>
+    <dt>${ICON.cpu} Anteile</dt>
+    <dd>user <b>${fmtPct(cpuU)}</b> · sys <b>${fmtPct(cpuS)}</b> · wait <b>${fmtPct(cpuW)}</b></dd>
+    <dt>${ICON.temp} Temperatur</dt>
+    <dd><b>${temp!=null?`${esc(temp)} °C`:'–'}</b> ${twarn?'<span class="badge red">WARN</span>':'<span class="badge green">OK</span>'}</dd>
+    <dt>${ICON.syno} System</dt>
+    <dd>${esc(model||'')} · DSM ${esc(dsmVersion||'')} · Uptime ${esc(uptimeHuman)}</dd>
+    <dt>${ICON.ntp} NTP</dt>
+    <dd>${ntpe!=null?(ntpe?'<span class="badge green chip">on</span>':'<span class="badge red chip">off</span>'):'–'}
+        ${ntps?`<span class="small mono">(${esc(ntps)})</span>`:''}</dd>
+    <dt>${ICON.psu} PSU</dt>
+    <dd>
+      ${rps?'<span class="badge blue chip">redundant</span>':''}
+      ${rp1!=null?`RP1 ${rp1?'<span class="badge green chip">OK</span>':'<span class="badge red chip">NOK</span>'}`:''}
+      ${rp2!=null?` · RP2 ${rp2?'<span class="badge green chip">OK</span>':'<span class="badge red chip">NOK</span>'}`:''}
+    </dd>
+    <dt>${ICON.fw} Firmware</dt>
+    <dd>${esc(fwv||dsmVersion)} ${fwd?`(${esc(fwd)})`:''}</dd>
+  </div>
+</div>`;
+
+    const cardNet = `
+<div class="card" style="grid-column: span 6">
+  <h3>${ICON.net} Netzwerk</h3>
+  ${
+    ifs.length===0 ? '<div class="sub small">Keine Interfaces.</div>' :
+    ifs.map(n=>{
+      const speedStr = fmtLinkSpeed(n.speed);
+      const upBadge  = n.up?'<span class="badge green"><span class="dot ok"></span>Up</span>'
+                           :'<span class="badge red"><span class="dot bad"></span>Down</span>';
+      return `
+      <div class="iface">
+        <div>
+          <div><b>${esc(n.name)}</b>${n.members?.length?` <span class="small">(${esc(n.members.join(', '))})</span>`:''}</div>
+          <div class="small mono">${esc(n.ipv4||'–')}${n.ipv6?` · ${esc(n.ipv6)}`:''} · ${speedStr}</div>
+        </div>
+        <div class="row small">${upBadge} · Rx ${Math.max(0,n.rx_kBps||0)} kB/s · Tx ${Math.max(0,n.tx_kBps||0)} kB/s</div>
+      </div>`;
+    }).join('')
+  }
+</div>`;
+
+    const cardVols = `
+<div class="card" style="grid-column: span 6">
+  <h3>${ICON.vol} Volumes</h3>
+  ${
+    vols.length===0 ? '<div class="sub small">Keine Volumes.</div>' :
+    vols.map(v=>{
+      const usedPct = v.totalGB>0 ? Math.round((v.usedGB/v.totalGB)*100) : 0;
+      const st = (v.status||'').toLowerCase();
+      const cls = /attention|warning|degrad|repair|rebuild|crash/.test(st) ? 'yellow'
+                : /normal|healthy|good|mounted|ok/.test(st) ? 'green'
+                : st? 'red':'blue';
+      return `
+      <div class="row" style="align-items:center;gap:10px;margin:8px 0">
+        <div style="min-width:130px">
+          <b>${esc(v.name)}</b>
+          <div class="small">${esc(v.fsType||'fs')} · <span class="badge ${cls}">${esc(v.status||'–')}</span></div>
+        </div>
+        <div class="progress" style="flex:1"><span class="bar" style="width:${usedPct}%"></span></div>
+        <div class="small mono" style="min-width:150px;text-align:right">${esc(v.usedGB)}/${esc(v.totalGB)} GB</div>
+      </div>`;
+    }).join('')
+  }
+</div>`;
+
+    const cardDisks = `
+<div class="card" style="grid-column: span 6">
+  <h3>${ICON.disk} Disks</h3>
+  ${
+    disks.length===0 ? '<div class="sub small">Keine Disks.</div>' :
+    `<div class="kv">${
+      disks.map(d=>{
+        const st = /normal|good|ok|healthy/i.test(d.health||'') ? 'green'
+                : /warn|caution|attention|degrad/i.test(d.health||'') ? 'yellow'
+                : (d.health? 'red':'blue');
+        const util = (d.utilPercent!=null)? ` · Util ${fmtPct(d.utilPercent)}` : '';
+        return `
+          <dt><b>${esc(d.name)}</b></dt>
+          <dd class="small">
+            ${d.model?`${esc(d.model)} · `:''}
+            ${isFinite(d.sizeGB)&&d.sizeGB>0?`${esc(d.sizeGB)} GB · `:''}
+            ${isFinite(d.tempC)?`${esc(d.tempC)} °C · `:''}
+            <span class="badge ${st}">${esc(d.health||'–')}</span>${util}
+          </dd>`;
+      }).join('')}
+    </div>`
+  }
+</div>`;
+
+    const cardDocker = `
+<div class="card" style="grid-column: span 6">
+  <h3>${ICON.docker} Docker</h3>
+  ${
+    docks.length===0 ? '<div class="sub small">Keine Container.</div>' :
+    `<div class="kv">${
+      docks.map(d=>{
+        const st = /running/i.test(d.status) ? 'green' : /paused/i.test(d.status) ? 'yellow' : 'red';
+        const cpuStr = (d.cpu!=null) ? ` · CPU ${d.cpu}%` : '';
+        const memStr = (d.memMB!=null) ? ` · RAM ${d.memMB} MB` : '';
+        return `
+          <dt><b>${esc(d.name)}</b></dt>
+          <dd class="small">
+            <span class="badge ${st}">${esc(d.status)}</span>${cpuStr}${memStr}
+            ${d.ports?` · <span class="mono">${esc(d.ports)}</span>`:''}
+          </dd>`;
+      }).join('')}
+    </div>`
+  }
+</div>`;
+
+    const cardVMM = `
+<div class="card" style="grid-column: span 6">
+  <h3>${ICON.vm} Virtual Machine Manager</h3>
+  ${
+    vms.length===0 ? '<div class="sub small">Keine VMs.</div>' :
+    `<div class="kv">${
+      vms.map(v=>{
+        const st = /on|running|up/i.test(v.power||'') ? 'green'
+                 : /off|stopped/i.test(v.power||'') ? 'red'
+                 : 'yellow';
+        const cpuUse = (v.cpu_usage!=null)? ` · CPU ${fmtPct(v.cpu_usage)}` : '';
+        const ramUse = (v.ramMB_used!=null)? ` used ${v.ramMB_used} MB` : '';
+        const disksT = (v.diskGB_total && v.diskGB_total>0)? ` · Disk ${v.diskGB_total} GB` : '';
+        return `
+          <dt><b>${esc(v.name)}</b></dt>
+          <dd class="small">
+            <span class="badge ${st}">${esc(v.power||'–')}</span>
+            · vCPU ${esc(v.cpu_vcpu||0)} · RAM ${esc(v.ramMB_total||0)} MB${ramUse}${cpuUse}${disksT}
+          </dd>`;
+      }).join('')}
+    </div>`
+  }
+</div>`;
+
+    const cardCams = `
+<div class="card" style="grid-column: span 8">
+  <h3>${ICON.cam} Cameras <span class="small">(${cams.length})</span></h3>
+  <div class="camgrid">
+    ${
+      cams.map(c=>{
+        const name    = esc(camName(c));
+        const online  = !!c.connected;
+        const enabled = !!c.enabled;
+        const recRaw  = String(c.recStatus||'').toLowerCase();
+        let recTxt    = c.recording ? 'rec' : 'idle';
+        if (!c.recording && recRaw && recRaw!=='recording' && recRaw!=='idle') recTxt = recRaw;
+
+        return `
+        <div class="cambadge">
+          <div class="cam-title">${name}</div>
+          <div class="cam-tags small">
+            <span class="badge ${online ? 'green' : 'red'}">
+              <span class="dot ${online ? 'ok' : 'bad'}"></span>${online ? 'online' : 'offline'}
+            </span>
+            <span class="badge ${enabled ? 'blue' : 'yellow'}">${enabled ? 'enabled' : 'disabled'}</span>
+            <span class="badge ${recTxt === 'rec' ? 'green' : 'blue'}">${esc(recTxt)}</span>
+            <span class="badge blue mono">snap</span>
+          </div>
+        </div>`;
+      }).join('')
+    }
+  </div>
+</div>`;
+
+    const cardSessions = `
+<div class="card" style="grid-column: span 12">
+  <h3>Sessions</h3>
+  ${
+    sess.length===0 ? '<div class="sub small">Keine Sessions.</div>' :
+    sess.map(s=>`
+      <div class="iface small">
+        <div><b>${esc(s.type||'-')}</b> · ${esc(s.descr||s.protocol||'')}</div>
+        <div class="mono">${esc(s.who||'-')} · ${esc(s.from||'-')} · ${esc(s.time||'-')}</div>
+      </div>
+    `).join('')
+  }
+</div>`;
+
+    const body = [
+      cardSystem, cardNet,
+      cardVols, cardDisks,
+      cardDocker, cardVMM,
+      cardCams,
+      cardSessions
+    ].join('\n');
+
+    const html = FRAME
+      .replaceAll('{{TITLE}}', esc('Synology – Main'))
+      .replaceAll('{{STAMP}}', esc(new Date().toLocaleString('de-DE')))
+      .replaceAll('{{BODY}}', body);
+
+    await ensureState(CFG.DASHBOARD_MAIN, {type:'string',role:'html'});
+    await safeSet(CFG.DASHBOARD_MAIN, html);
+  }catch(e){
+    say('warn', `renderMain: ${e}`);
+  }
+}
+
+async function renderSurv(){
+  try{
+    let cams = [];
+    try{ cams = JSON.parse(await safeGet(idJoin(CFG.ROOT,'Surveillance.Cameras.listJson'), '[]')); }catch{}
+    const camName = (c) => String(
+      c?.title || c?.name || c?.dispName || c?.devName || c?.hostname || c?.key || ''
+    );
+    cams.sort((a,b)=>camName(a).localeCompare(camName(b),'de',{sensitivity:'base'}));
+
+    const items = [];
+    for (const c of cams){
+      const name = esc(camName(c));
+      const base = idJoin(CFG.ROOT,'Surveillance','Cameras', c.key || idSafe(camName(c)));
+
+      let snap = await safeGet(base + '.snapshotUrlVis', '');
+      if (!snap){
+        snap = c.snapshotUrlVis || c.snapshotUrl || c.snapshotUrlAlt || c.snapshotUrlAlt2 || '';
+      }
+
+      const online  = !!c.connected;
+      const enabled = !!c.enabled;
+      const recRaw  = String(c.recStatus||'').toLowerCase();
+      let recTxt    = c.recording ? 'rec' : 'idle';
+      if (!c.recording && recRaw && recRaw!=='recording' && recRaw!=='idle') recTxt = recRaw;
+
+      items.push(`
+        <div class="camcard">
+          <div class="cam-title">${name}</div>
+          ${snap
+            ? `<img class="camimg" src="${esc(snap)}" alt="${name}" loading="lazy" referrerpolicy="no-referrer">`
+            : `<div class="sub small">kein Snapshot</div>`}
+          <div class="cam-meta small">
+            <span class="badge ${online ? 'green' : 'red'}">
+              <span class="dot ${online ? 'ok' : 'bad'}"></span>${online ? 'online' : 'offline'}
+            </span>
+            <span class="badge ${enabled ? 'blue' : 'yellow'}">${enabled ? 'enabled' : 'disabled'}</span>
+            <span class="badge ${recTxt === 'rec' ? 'green' : 'blue'}">${esc(recTxt)}</span>
+          </div>
+        </div>
+      `);
+    }
+
+    const body = `
+<div class="card span-12">
+  <h3>${ICON.cam} Surveillance <span class="small">(${cams.length})</span></h3>
+  <div class="survgrid">
+    ${items.join('')}
+  </div>
+</div>`;
+
+    const html = FRAME
+      .replaceAll('{{TITLE}}', esc('Synology – Surveillance'))
+      .replaceAll('{{STAMP}}', esc(new Date().toLocaleString('de-DE')))
+      .replaceAll('{{BODY}}', body);
+
+    await ensureState(CFG.DASHBOARD_SURV, {type:'string',role:'html'});
+    await safeSet(CFG.DASHBOARD_SURV, html);
+  }catch(e){
+    say('warn',`renderSurv: ${e}`);
+  }
+}
+
+async function renderSurvMiniToFile() {
+  if (!SURV_MINI_HTML.ENABLED) return;
+
+  try {
+    const cams = [];
+
+    for (const key of SURV_MINI_HTML.CAM_KEYS) {
+      const base = idJoin(CFG.ROOT, 'Surveillance', 'Cameras', key);
+      const title = await safeGet(base + '.title', key);
+      // bevorzugt snapshotUrlVis, Fallback wie im großen Dashboard
+      let snap = await safeGet(base + '.snapshotUrlVis', '');
+      if (!snap) {
+        snap = await safeGet(base + '.snapshotUrl', '') ||
+               await safeGet(base + '.snapshotUrlAlt', '') ||
+               await safeGet(base + '.snapshotUrlAlt2', '');
+      }
+      cams.push({ key, title, snap });
+    }
+
+    const itemsHtml = cams.map(c => {
+      const name = esc(c.title || c.key || '');
+      const src  = esc(c.snap || '');
+      return `
+        <div class="mini-cam">
+          <div class="mini-cam-title">${name}</div>
+          ${
+            src
+              ? `<img class="mini-cam-img" src="${src}" data-base="${src}" alt="${name}" loading="lazy" referrerpolicy="no-referrer">`
+              : `<div class="mini-cam-placeholder">kein Snapshot</div>`
+          }
+        </div>`;
+    }).join('');
+
+    const body = `
+<div class="card span-12 mini-cam-wrapper">
+  <h3>${ICON.cam} Live-Snapshots</h3>
+  <div class="mini-cam-grid">
+    ${itemsHtml}
+  </div>
+</div>`;
+
+    // FRAME verwenden und zusätzliche Styles + Auto-Refresh-Script anhängen
+    const html = FRAME
+      .replaceAll('{{TITLE}}', esc(SURV_MINI_HTML.TITLE))
+      .replaceAll('{{STAMP}}', esc(new Date().toLocaleString('de-DE')))
+      .replaceAll('{{BODY}}', body)
+      + `
+<style>
+  .mini-cam-wrapper { padding-top: 8px; }
+  .mini-cam-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+  }
+  @media (max-width: 1100px) {
+    .mini-cam-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 700px) {
+    .mini-cam-grid { grid-template-columns: 1fr; }
+  }
+  .mini-cam {
+    background: rgba(15,23,42,.9);
+    border-radius: 14px;
+    border: 1px solid rgba(148,163,184,.35);
+    padding: 8px 8px 10px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mini-cam-title {
+    font-size: 13px;
+    font-weight: 800;
+    color: #e5e7eb;
+  }
+  .mini-cam-img {
+    width: 100%;
+    aspect-ratio: 16/9;
+    object-fit: cover;
+    border-radius: 10px;
+    border: 1px solid #1f2937;
+    background: #020617;
+  }
+  .mini-cam-placeholder {
+    font-size: 12px;
+    color: #9ca3af;
+    padding: 16px;
+    text-align: center;
+    border-radius: 10px;
+    border: 1px dashed #4b5563;
+    background: rgba(15,23,42,.6);
+  }
+</style>
+<script>
+(function(){
+  var REFRESH_MS = 10000; // alle 10 Sekunden
+
+  function nextUrl(base) {
+    if (!base) return '';
+    var sep = base.indexOf('?') === -1 ? '?' : '&';
+    return base + sep + 'ts=' + Date.now();
+  }
+
+  function refreshImgs() {
+    var imgs = document.querySelectorAll('img.mini-cam-img[data-base]');
+    imgs.forEach(function(img){
+      var base = img.getAttribute('data-base');
+      if (!base) return;
+      img.src = nextUrl(base);
+    });
+  }
+
+  // initial data-base setzen, falls noch nicht vorhanden
+  window.addEventListener('load', function(){
+    var imgs = document.querySelectorAll('img.mini-cam-img');
+    imgs.forEach(function(img){
+      var base = img.getAttribute('data-base') || img.getAttribute('src');
+      if (base) {
+        img.setAttribute('data-base', base);
+      }
+    });
+    // erste Aktualisierung kurz nach dem Laden
+    setTimeout(refreshImgs, 1000);
+  });
+
+  // periodische Aktualisierung
+  setInterval(refreshImgs, REFRESH_MS);
+})();
+</script>`;
+
+       // HTML nach 0_userdata.0 schreiben
+    const adapter = CFG.IOB_FILES_ADAPTER || '0_userdata.0';
+    const fileRel = (SURV_MINI_HTML.FILE_PATH || '/SurvMini.html').replace(/^\/+/, '/');
+
+    try {
+      await writeFileP(adapter, fileRel, html, 'text/html; charset=utf-8');
+      // kein Template-String, nur einfache Verkettung:
+      if (!CFG.SILENT) log('SurvMini HTML geschrieben: ' + adapter + fileRel, 'info');
+    } catch (e) {
+      // Fallback: als State ablegen, falls writeFile nicht geht
+      const dp = '0_userdata.0.vis.Dashboards.SurvMiniHTML';
+      await ensureState(dp, { type:'string', role:'html' });
+      await safeSet(dp, html);
+      say('warn', 'renderSurvMiniToFile: writeFile fehlgeschlagen (' + e + '), HTML in ' + dp + ' abgelegt.');
+    }
+  } catch (e) {
+    say('warn', 'renderSurvMiniToFile: ' + e);
+  }
+}
+
+
+/*** === ALERTS === ***/
+const WARN_LATCH = {};
+function shouldWarn(key){
+  const now = Date.now();
+  const last = WARN_LATCH[key]||0;
+  if (now - last < (CFG.ALERTS?.COOLDOWN_MS || 0)) return false;
+  WARN_LATCH[key] = now;
+  return true;
+}
+
+// vereinfachte Variante: nur Kamerastates aus listJson + States prüfen
+async function getCamsFromStates(){
+  let cams = [];
+  try{ cams = JSON.parse(await safeGet(idJoin(CFG.ROOT,'Surveillance.Cameras.listJson'),'[]')); }catch{}
+  if (!Array.isArray(cams)) cams = [];
+  const out=[];
+  for (const c of cams){
+    const key = c.key || idSafe(c.title || c.name || '');
+    const base = idJoin(CFG.ROOT,'Surveillance','Cameras', key);
+    out.push({
+      key,
+      title: await safeGet(base+'.title', c.title || c.name || key),
+      connected: await safeGet(base+'.connected', c.connected ?? null),
+      enabled:   await safeGet(base+'.enabled',   c.enabled   ?? null)
+    });
+  }
+  return out;
+}
+
+async function checkAndWarn(){
+  if (!CFG.ALERTS?.ENABLED) return;
+
+  const t = num(await safeGet(idJoin(CFG.ROOT,'Info.sys.temperature'), null));
+  if (isFinite(t) && t > (CFG.ALERTS.SYS_TEMP_C_WARN||999) && shouldWarn('sys_temp')){
+    const msg = `⚠️ Synology: Systemtemperatur ${t} °C > ${CFG.ALERTS.SYS_TEMP_C_WARN} °C`;
+    await setStateAsync(CFG.DISCORD_SEND_TEXT, msg, false);
+  }
+
+  let disks=[];
+  try{ disks = JSON.parse(await safeGet(idJoin(CFG.ROOT,'Storage.disksJson'),'[]')); }catch{}
+  const bad = disks.filter(d=>!/^(normal|good|ok|healthy)$/i.test(String(d.health||'')));
+  if (bad.length && shouldWarn('disks_bad')){
+    const msg = '⚠️ Synology: Disk Health: ' + bad.map(d=>`${d.name}:${d.health||'unknown'}`).join(', ');
+    await setStateAsync(CFG.DISCORD_SEND_TEXT, msg, false);
+  }
+
+  const tMax = CFG.ALERTS.DISK_TEMP_C_WARN;
+  if (isFinite(tMax) && tMax > 0) {
+    const hot = disks.filter(d => isFinite(d.tempC) && d.tempC > tMax);
+    if (hot.length && shouldWarn('disks_hot')) {
+      const msg = '⚠️ Disks heiß: ' + hot.map(d => `${d.name}:${d.tempC}°C`).join(', ') + ` (>${tMax}°C)`;
+      await setStateAsync(CFG.DISCORD_SEND_TEXT, msg, false);
+    }
+  }
+
+  const cams = await getCamsFromStates();
+  const off = cams.filter(c=>c.connected===false);
+  if (off.length && shouldWarn('cams_offline')){
+    const msg = '⚠️ Surveillance: offline: ' + off.map(c=>c.title).join(', ');
+    await setStateAsync(CFG.DISCORD_SEND_TEXT, msg, false);
+  }
+}
+
+/*** === DEBUG TRIGGER === ***/
+const DBG = idJoin(CFG.ROOT,'Debug.trigger');
+async function runDebugTrigger(cmd){
+  const c=(cmd||'').toString().toLowerCase().trim();
+  if (!c) return;
+  if (/(all|\*)/.test(c)) {
+    await fetchSystem();
+    await fetchUtilization();
+    await fetchNetwork();
+    await fetchStorage();
+    await fetchDocker();
+    await fetchVMM();
+    await fetchSessions();
+  }
+  if (/util|sys|cpu|mem|load/.test(c)) await fetchUtilization();
+  if (/net|network/.test(c)) await fetchNetwork();
+  if (/vol|volume|stor/.test(c)) await fetchStorage();
+  if (/disk|smart/.test(c)) await fetchStorage();
+  if (/dock|container/.test(c)) await fetchDocker();
+  if (/vm|vmm/.test(c)) await fetchVMM();
+  if (/sess|session/.test(c)) await fetchSessions();
+  if (/cam|surv/.test(c)) { await ssGetHomeMode(); await ssListCameras(); }
+  if (/datauri|snapdata/.test(c)) { await refreshDataUriSnapshots(true); }
+  if (/^snap |^snapshot |^discord /i.test(cmd)) { await sendSnapshotToDiscord(cmd); }
+  await renderMain(); await renderSurv();
+}
+on({id:DBG, change:'ne'}, async obj=>{
+  try{ await runDebugTrigger(obj.state.val); await safeSet(DBG,''); }
+  catch(e){ say('warn',`Debug trigger error: ${e}`); }
+});
+
+/*** === MAIN LOOP === ***/
+async function pollOnce(){
+  try{
+    if (!AUTH.sid){
+      const ok = await loginAll();
+      if (!ok){
+        setTimeout(pollOnce, CFG.LOGIN_RETRY_MS);
+        return;
+      }
+      await apiInfo();
+    }
+    // NEU: Poll-Zähler und Timestamp
+    POLL_COUNTER++;
+    await safeSet(idJoin(CFG.ROOT,'Info.pollCount'), POLL_COUNTER);
+    await safeSet(idJoin(CFG.ROOT,'Info.lastPollTs'), new Date().toISOString());
+
+    try{
+      await fetchSystem();
+    }catch(e){
+      if ((''+e).includes('Unauthorized')){
+        await logout();
+        const ok=await loginAll();
+        if(!ok){
+          setTimeout(pollOnce, CFG.LOGIN_RETRY_MS);
+          return;
+        }
+        await apiInfo();
+      }
+    }
+
+    await Promise.allSettled([
+      fetchUtilization(),
+      fetchNetwork(),
+      fetchSessions(),
+      fetchStorage(),
+      (CFG.ENABLE.DOCKER ? fetchDocker() : Promise.resolve()),
+      (CFG.ENABLE.VMM    ? fetchVMM()    : Promise.resolve()),
+      (CFG.ENABLE.SURVEILLANCE ? (async()=>{ await ssGetHomeMode(); await ssListCameras(); })() : Promise.resolve())
+    ]);
+
+    if (CFG.ENABLE.DASHBOARD){
+      await renderMain();
+      await renderSurv();
+      await renderSurvMiniToFile();   
+
+    }
+
+    await checkAndWarn();
+
+    await refreshDataUriSnapshots(false);
+
+
+    await safeSet(idJoin(CFG.ROOT,'Info.lastSuccess'), new Date().toISOString());
+  }catch(e){
+    say('warn',`pollOnce error: ${e}`);
+  }finally{
+    setTimeout(pollOnce, CFG.POLL_MS);
+  }
+}
+
+/*** === INIT === ***/
+(async ()=>{
+  await ensureState(idJoin(CFG.ROOT,'Info.lastSuccess'), {type:'string',role:'text'});
+  await ensureState(idJoin(CFG.ROOT,'Info.lastLogin'),   {type:'string',role:'text'});
+  await ensureState(idJoin(CFG.ROOT,'Info.apiMap.json'), {type:'string',role:'json'});
+  await ensureState(CFG.DASHBOARD_MAIN,                  {type:'string',role:'html'});
+  await ensureState(CFG.DASHBOARD_SURV,                  {type:'string',role:'html'});
+
+  await ensureState(DBG,                                 {type:'string',role:'text',read:true,write:true});
+  await ensureState(idJoin(CFG.ROOT,'Surveillance.Debug.testSnapshotCam'),
+                    {type:'string',role:'text',read:true,write:true});
+ 
+  await ensureState(idJoin(CFG.ROOT,'Info.pollCount'),   {type:'number',role:'value'});
+  await ensureState(idJoin(CFG.ROOT,'Info.lastPollTs'),  {type:'string',role:'text'});
+
+  await ensureState(idJoin(CFG.ROOT,'Utilization.cpu.total'),    {type:'number',role:'value.percent',unit:'%'});
+  await ensureState(idJoin(CFG.ROOT,'Utilization.cpu.user'),     {type:'number',role:'value.percent',unit:'%'});
+  await ensureState(idJoin(CFG.ROOT,'Utilization.cpu.system'),   {type:'number',role:'value.percent',unit:'%'});
+  await ensureState(idJoin(CFG.ROOT,'Utilization.cpu.wait'),     {type:'number',role:'value.percent',unit:'%'});
+  await ensureState(idJoin(CFG.ROOT,'Utilization.load.1min'),    {type:'number',role:'value'});
+  await ensureState(idJoin(CFG.ROOT,'Utilization.memory.sizeMB'),{type:'number',role:'value',unit:'MB'});
+  await ensureState(idJoin(CFG.ROOT,'Utilization.memory.usedMB'),{type:'number',role:'value',unit:'MB'});
+  await ensureState(idJoin(CFG.ROOT,'Storage.volumesJson'),      {type:'string',role:'json'});
+  await ensureState(idJoin(CFG.ROOT,'Storage.disksJson'),        {type:'string',role:'json'});
+  await ensureState(idJoin(CFG.ROOT,'Network.listJson'),         {type:'string',role:'json'});
+
+  await loginForSnapshots();
+  setTimeout(pollOnce, CFG.START_DELAY_MS);
+})();
