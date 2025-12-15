@@ -71,7 +71,11 @@ State Layout (excerpt)
 Dashboards
 ----------
 - 0_userdata.0.vis.Dashboards.Synology (HTML)
+- <img width="800" height="230" alt="Screenshot 2025-12-15 at 15 11 24" src="https://github.com/user-attachments/assets/c55e2759-e69f-456c-9029-8fe3031ef604" />
+
 - 0_userdata.0.vis.Dashboards.Surveillance (HTML)
+- <img width="800" height="157" alt="Screenshot 2025-12-15 at 15 12 37" src="https://github.com/user-attachments/assets/bf66ef9f-411e-4550-8b24-6a7e4014cc08" />
+
 - Optional file output: 0_userdata.0/<your-path>/SurvMini.html
 
 Requirements
