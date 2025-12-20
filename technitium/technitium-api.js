@@ -1,7 +1,11 @@
 /***************************************************************
- * Technitium DNS Server – ioBroker Script-Adapter (v1.0)
- * Für ioBroker JavaScript Adapter >= 9.0.11
+ * Technitium DNS Server – ioBroker Script-Adapter (v1.1)
+ * Kompatibel mit ioBroker JavaScript Adapter 9.0.11
  *
+ * Fixes ggü. v1.0:
+ *  - kein setObjectNotExists (nutzt nur existsState + createState)
+ *  - saubere Fehlermeldungen (keine Stack-Warn-Spam)
+ *  - Blocking Toggle (enableBlocking) + Cache Flush + Refresh
  * Features:
  *  - Polling: /api/settings/get (Basis-Status + enableBlocking)
  *  - Steuerung: enableBlocking (DNS-Blocking) via /api/settings/set
@@ -14,6 +18,7 @@
  *  - Ein "Set"-Call überschreibt nur die Werte der übergebenen Parameter.
  *    (D.h. enableBlocking alleine setzen ist ok.) :contentReference[oaicite:2]{index=2}
  ***************************************************************/
+
 'use strict';
 
 /*** =========================
@@ -22,76 +27,68 @@
 const CFG = {
   ROOT: '0_userdata.0.Geraete.TechnitiumDNS',
 
-  // Technitium Web/API Endpoint
-  HOST: '127.0.0.1',
-  PORT: 5380,           // Standard Web Console Port
-  HTTPS: false,         // true, wenn du die API über TLS erreichst
-  BASE_PATH: '',        // z.B. '/dns' bei Reverse-Proxy; sonst leer
-  IGNORE_TLS_ERRORS: false, // bei Self-Signed TLS ggf. true
+  // WICHTIG: 127.0.0.1 funktioniert nur, wenn Technitium im gleichen Namespace läuft!
+  HOST: '10.1.1.72',   // <-- anpassen!
+  PORT: 5380,
+  HTTPS: false,
+  BASE_PATH: '',       // z.B. '/dns' falls Reverse Proxy; sonst ''
 
-  // Auth:
-  // Empfehlung: API_TOKEN nutzen (nicht ablaufend). Alternativ USER/PASS.
-  API_TOKEN: '',        // via /api/user/createToken (oder über UI) :contentReference[oaicite:3]{index=3}
-  USER: 'admin',
+  IGNORE_TLS_ERRORS: false,
+
+  // Auth: empfohlen API_TOKEN (nicht ablaufend)
+  API_TOKEN: '',       // <-- eintragen (empfohlen)
+  USER: 'admin',       // optional wenn kein API_TOKEN
   PASS: 'admin',
-  TOTP: '',             // optional, falls 2FA aktiv (6-stellig)
+  TOTP: '',
 
-  // Polling
   POLL_MS: 30_000,
   TIMEOUT_MS: 12_000,
 
-  // Dashboard Stats optional
   DASHBOARD_STATS_ENABLED: true,
-  DASHBOARD_STATS_TYPE: 'LastHour', // LastHour|LastDay|LastWeek|LastMonth|LastYear|Custom :contentReference[oaicite:4]{index=4}
+  DASHBOARD_STATS_TYPE: 'LastHour',
   DASHBOARD_STATS_UTC: true
 };
 
 /*** =========================
- * ioBroker Helpers (robust)
+ * Helpers
  * ========================= */
 function logI(msg) { console.log(`[TechnitiumDNS] ${msg}`); }
 function logW(msg) { console.warn(`[TechnitiumDNS] ${msg}`); }
 function logE(msg) { console.error(`[TechnitiumDNS] ${msg}`); }
 
-function safeGetState(id) {
-  try { return getState(id); } catch { return null; }
-}
+function existsDP(id) { try { return existsState(id); } catch { return false; } }
 
-function setStateIfChanged(id, val, ack = true) {
-  const s = safeGetState(id);
-  const sval = s ? s.val : undefined;
-  const sack = s ? s.ack : undefined;
-
-  // primitive compare; for objects stringify
-  const isObj = val !== null && typeof val === 'object';
-  const newVal = isObj ? JSON.stringify(val) : val;
-  const oldVal = isObj ? (typeof sval === 'string' ? sval : JSON.stringify(sval)) : sval;
-
-  if (!s || oldVal !== newVal || sack !== ack) {
-    setState(id, newVal, ack);
+function ensureState(id, initial, common) {
+  if (!existsDP(id)) {
+    // createState signature in ioBroker JS unterstützt i.d.R. (id, initial, common)
+    createState(id, initial, common || {});
   }
 }
 
-function ensureObject(id, obj) {
-  try { setObjectNotExists(id, obj); } catch (e) { /* ignore */ }
+function safeGet(id) {
+  try {
+    if (!existsDP(id)) return null;
+    const s = getState(id);
+    return s ? s.val : null;
+  } catch { return null; }
 }
 
-function ensureState(id, common, initialValue) {
-  ensureObject(id, {
-    type: 'state',
-    common: Object.assign({
-      name: id,
-      read: true,
-      write: false,
-      role: 'state',
-      type: 'mixed'
-    }, common || {}),
-    native: {}
-  });
+function setIfChanged(id, val, ack = true) {
+  try {
+    const s = existsDP(id) ? getState(id) : null;
+    const oldVal = s ? s.val : undefined;
+    const oldAck = s ? s.ack : undefined;
 
-  const s = safeGetState(id);
-  if ((s === null || s === undefined) && initialValue !== undefined) {
-    try { setState(id, initialValue, true); } catch { /* ignore */ }
+    // JSON/Object handling
+    const isObj = val !== null && typeof val === 'object';
+    const newVal = isObj ? JSON.stringify(val) : val;
+    const curVal = isObj ? (typeof oldVal === 'string' ? oldVal : JSON.stringify(oldVal)) : oldVal;
+
+    if (!s || curVal !== newVal || oldAck !== ack) {
+      setState(id, newVal, ack);
+    }
+  } catch (e) {
+    logW(`setIfChanged(${id}) failed: ${e?.message || e}`);
   }
 }
 
@@ -102,12 +99,12 @@ function nowIsoLocal() {
 }
 
 /*** =========================
- * HTTP Client (ohne externe Module)
+ * HTTP Client (ohne axios)
  * ========================= */
 const http = require('http');
 const https = require('https');
 
-function buildBasePath() {
+function basePath() {
   if (!CFG.BASE_PATH) return '';
   return CFG.BASE_PATH.startsWith('/') ? CFG.BASE_PATH : `/${CFG.BASE_PATH}`;
 }
@@ -126,7 +123,7 @@ function httpJson(method, path, params, bodyForm) {
     const lib = isHttps ? https : http;
 
     const query = params && Object.keys(params).length ? `?${toQuery(params)}` : '';
-    const fullPath = `${buildBasePath()}${path}${query}`;
+    const fullPath = `${basePath()}${path}${query}`;
 
     const headers = {};
     let body = null;
@@ -146,55 +143,37 @@ function httpJson(method, path, params, bodyForm) {
       timeout: CFG.TIMEOUT_MS
     };
 
-    if (isHttps && CFG.IGNORE_TLS_ERRORS) {
-      options.rejectUnauthorized = false;
-    }
+    if (isHttps && CFG.IGNORE_TLS_ERRORS) options.rejectUnauthorized = false;
 
     const req = lib.request(options, (res) => {
       let data = '';
       res.setEncoding('utf8');
-
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         if (!data) return reject(new Error(`Empty response for ${path}`));
-        try {
-          const json = JSON.parse(data);
-          resolve(json);
-        } catch (e) {
-          reject(new Error(`Invalid JSON response for ${path}: ${e.message}; data=${data.slice(0, 300)}`));
-        }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error(`Invalid JSON for ${path}: ${e.message}; data=${data.slice(0,200)}`)); }
       });
     });
 
-    req.on('timeout', () => {
-      req.destroy(new Error(`Timeout after ${CFG.TIMEOUT_MS}ms for ${path}`));
-    });
-
+    req.on('timeout', () => req.destroy(new Error(`Timeout after ${CFG.TIMEOUT_MS}ms for ${path}`)));
     req.on('error', reject);
-
     if (body) req.write(body);
     req.end();
   });
 }
 
 /*** =========================
- * Technitium API Wrapper
+ * Technitium API
  * ========================= */
 let token = (CFG.API_TOKEN && CFG.API_TOKEN.trim()) ? CFG.API_TOKEN.trim() : null;
-let lastLoginAt = 0;
 
 async function login() {
   if (CFG.API_TOKEN && CFG.API_TOKEN.trim()) {
     token = CFG.API_TOKEN.trim();
     return;
   }
-
-  // /api/user/login?user=...&pass=...&includeInfo=true :contentReference[oaicite:5]{index=5}
-  const params = {
-    user: CFG.USER,
-    pass: CFG.PASS,
-    includeInfo: 'true'
-  };
+  const params = { user: CFG.USER, pass: CFG.PASS, includeInfo: 'true' };
   if (CFG.TOTP && CFG.TOTP.trim()) params.totp = CFG.TOTP.trim();
 
   const res = await httpJson('GET', '/api/user/login', params);
@@ -202,24 +181,22 @@ async function login() {
     throw new Error(res.errorMessage || `Login failed: status=${res.status}`);
   }
   token = res.token;
-  lastLoginAt = Date.now();
 
-  // optional: user info schreiben
-  setStateIfChanged(`${CFG.ROOT}.info.username`, res.username || '', true);
-  setStateIfChanged(`${CFG.ROOT}.info.displayName`, res.displayName || '', true);
-  if (res.info && typeof res.info === 'object') {
-    setStateIfChanged(`${CFG.ROOT}.info.serverVersion`, res.info.version || '', true);
-    setStateIfChanged(`${CFG.ROOT}.info.dnsServerDomain`, res.info.dnsServerDomain || '', true);
-    setStateIfChanged(`${CFG.ROOT}.info.uptimestamp`, res.info.uptimestamp || '', true);
-  }
+  setIfChanged(`${CFG.ROOT}.info.username`, res.username || '', true);
+  setIfChanged(`${CFG.ROOT}.info.displayName`, res.displayName || '', true);
+
+  const info = res.info || {};
+  setIfChanged(`${CFG.ROOT}.info.serverVersion`, info.version || '', true);
+  setIfChanged(`${CFG.ROOT}.info.dnsServerDomain`, info.dnsServerDomain || '', true);
+  setIfChanged(`${CFG.ROOT}.info.uptimestamp`, info.uptimestamp || '', true);
 }
 
 async function apiGet(path, params, retry = true) {
   if (!token) await login();
   const res = await httpJson('GET', `/api/${path}`, Object.assign({}, params || {}, { token }));
 
-  // invalid-token ist ein offizieller Status :contentReference[oaicite:6]{index=6}
   if (res && res.status === 'invalid-token') {
+    // nur bei USER/PASS re-login versuchen
     if (!CFG.API_TOKEN && retry) {
       token = null;
       await login();
@@ -237,34 +214,25 @@ async function apiGet(path, params, retry = true) {
 /*** =========================
  * States anlegen
  * ========================= */
-function initObjects() {
-  ensureObject(CFG.ROOT, { type: 'device', common: { name: 'Technitium DNS Server' }, native: {} });
-  ensureObject(`${CFG.ROOT}.info`, { type: 'channel', common: { name: 'Info' }, native: {} });
-  ensureObject(`${CFG.ROOT}.settings`, { type: 'channel', common: { name: 'Settings (read)' }, native: {} });
-  ensureObject(`${CFG.ROOT}.control`, { type: 'channel', common: { name: 'Control (write)' }, native: {} });
-  ensureObject(`${CFG.ROOT}.raw`, { type: 'channel', common: { name: 'Raw JSON' }, native: {} });
+function initStates() {
+  ensureState(`${CFG.ROOT}.info.connected`, false, { type: 'boolean', role: 'indicator.reachable', read: true, write: false });
+  ensureState(`${CFG.ROOT}.info.lastUpdate`, '', { type: 'string', role: 'date', read: true, write: false });
+  ensureState(`${CFG.ROOT}.info.lastError`, '', { type: 'string', role: 'text', read: true, write: false });
 
-  ensureState(`${CFG.ROOT}.info.connected`, { type: 'boolean', role: 'indicator.reachable', read: true, write: false }, false);
-  ensureState(`${CFG.ROOT}.info.lastUpdate`, { type: 'string', role: 'date', read: true, write: false }, '');
-  ensureState(`${CFG.ROOT}.info.lastError`, { type: 'string', role: 'text', read: true, write: false }, '');
+  ensureState(`${CFG.ROOT}.info.username`, '', { type: 'string', role: 'text', read: true, write: false });
+  ensureState(`${CFG.ROOT}.info.displayName`, '', { type: 'string', role: 'text', read: true, write: false });
+  ensureState(`${CFG.ROOT}.info.serverVersion`, '', { type: 'string', role: 'text', read: true, write: false });
+  ensureState(`${CFG.ROOT}.info.dnsServerDomain`, '', { type: 'string', role: 'text', read: true, write: false });
+  ensureState(`${CFG.ROOT}.info.uptimestamp`, '', { type: 'string', role: 'text', read: true, write: false });
 
-  ensureState(`${CFG.ROOT}.info.username`, { type: 'string', role: 'text', read: true, write: false }, '');
-  ensureState(`${CFG.ROOT}.info.displayName`, { type: 'string', role: 'text', read: true, write: false }, '');
-  ensureState(`${CFG.ROOT}.info.serverVersion`, { type: 'string', role: 'text', read: true, write: false }, '');
-  ensureState(`${CFG.ROOT}.info.dnsServerDomain`, { type: 'string', role: 'text', read: true, write: false }, '');
-  ensureState(`${CFG.ROOT}.info.uptimestamp`, { type: 'string', role: 'text', read: true, write: false }, '');
+  ensureState(`${CFG.ROOT}.settings.enableBlocking`, false, { type: 'boolean', role: 'switch', read: true, write: false });
 
-  // Read: aktueller Serverzustand
-  ensureState(`${CFG.ROOT}.settings.enableBlocking`, { type: 'boolean', role: 'switch', read: true, write: false }, false);
+  ensureState(`${CFG.ROOT}.control.enableBlocking`, false, { type: 'boolean', role: 'switch', read: true, write: true });
+  ensureState(`${CFG.ROOT}.control.flushCache`, false, { type: 'boolean', role: 'button', read: true, write: true });
+  ensureState(`${CFG.ROOT}.control.refresh`, false, { type: 'boolean', role: 'button', read: true, write: true });
 
-  // Write: Steuerung
-  ensureState(`${CFG.ROOT}.control.enableBlocking`, { type: 'boolean', role: 'switch', read: true, write: true }, false);
-  ensureState(`${CFG.ROOT}.control.flushCache`, { type: 'boolean', role: 'button', read: true, write: true }, false);
-  ensureState(`${CFG.ROOT}.control.refresh`, { type: 'boolean', role: 'button', read: true, write: true }, false);
-
-  // Optional: Dashboard Stats
-  ensureState(`${CFG.ROOT}.raw.settingsJson`, { type: 'string', role: 'json', read: true, write: false }, '');
-  ensureState(`${CFG.ROOT}.raw.dashboardStatsJson`, { type: 'string', role: 'json', read: true, write: false }, '');
+  ensureState(`${CFG.ROOT}.raw.settingsJson`, '', { type: 'string', role: 'json', read: true, write: false });
+  ensureState(`${CFG.ROOT}.raw.dashboardStatsJson`, '', { type: 'string', role: 'json', read: true, write: false });
 }
 
 /*** =========================
@@ -278,38 +246,34 @@ async function poll() {
   pollBusy = true;
 
   try {
-    // 1) Settings holen: /api/settings/get :contentReference[oaicite:7]{index=7}
     const sRes = await apiGet('settings/get', {});
     const settings = sRes.response || {};
 
-    setStateIfChanged(`${CFG.ROOT}.info.connected`, true, true);
-    setStateIfChanged(`${CFG.ROOT}.info.lastUpdate`, nowIsoLocal(), true);
-    setStateIfChanged(`${CFG.ROOT}.info.lastError`, '', true);
+    setIfChanged(`${CFG.ROOT}.info.connected`, true, true);
+    setIfChanged(`${CFG.ROOT}.info.lastUpdate`, nowIsoLocal(), true);
+    setIfChanged(`${CFG.ROOT}.info.lastError`, '', true);
 
-    if (settings.version) setStateIfChanged(`${CFG.ROOT}.info.serverVersion`, settings.version, true);
-    if (settings.dnsServerDomain) setStateIfChanged(`${CFG.ROOT}.info.dnsServerDomain`, settings.dnsServerDomain, true);
-    if (settings.uptimestamp) setStateIfChanged(`${CFG.ROOT}.info.uptimestamp`, settings.uptimestamp, true);
+    if (settings.version) setIfChanged(`${CFG.ROOT}.info.serverVersion`, settings.version, true);
+    if (settings.dnsServerDomain) setIfChanged(`${CFG.ROOT}.info.dnsServerDomain`, settings.dnsServerDomain, true);
+    if (settings.uptimestamp) setIfChanged(`${CFG.ROOT}.info.uptimestamp`, settings.uptimestamp, true);
 
     const enableBlocking = !!settings.enableBlocking;
-    setStateIfChanged(`${CFG.ROOT}.settings.enableBlocking`, enableBlocking, true);
+    setIfChanged(`${CFG.ROOT}.settings.enableBlocking`, enableBlocking, true);
+    setIfChanged(`${CFG.ROOT}.control.enableBlocking`, enableBlocking, true);
 
-    // Control-State (GUI-Schalter) auf Serverzustand zurücksyncen (ack=true)
-    setStateIfChanged(`${CFG.ROOT}.control.enableBlocking`, enableBlocking, true);
+    setIfChanged(`${CFG.ROOT}.raw.settingsJson`, settings, true);
 
-    setStateIfChanged(`${CFG.ROOT}.raw.settingsJson`, settings, true);
-
-    // 2) Optional Dashboard Stats: /api/dashboard/stats/get :contentReference[oaicite:8]{index=8}
     if (CFG.DASHBOARD_STATS_ENABLED) {
       const dRes = await apiGet('dashboard/stats/get', {
         type: CFG.DASHBOARD_STATS_TYPE,
         utc: CFG.DASHBOARD_STATS_UTC ? 'true' : 'false'
       });
-      setStateIfChanged(`${CFG.ROOT}.raw.dashboardStatsJson`, dRes.response || {}, true);
+      setIfChanged(`${CFG.ROOT}.raw.dashboardStatsJson`, dRes.response || {}, true);
     }
   } catch (e) {
-    setStateIfChanged(`${CFG.ROOT}.info.connected`, false, true);
-    setStateIfChanged(`${CFG.ROOT}.info.lastUpdate`, nowIsoLocal(), true);
-    setStateIfChanged(`${CFG.ROOT}.info.lastError`, String(e?.message || e), true);
+    setIfChanged(`${CFG.ROOT}.info.connected`, false, true);
+    setIfChanged(`${CFG.ROOT}.info.lastUpdate`, nowIsoLocal(), true);
+    setIfChanged(`${CFG.ROOT}.info.lastError`, String(e?.message || e), true);
     logW(`Polling failed: ${e?.message || e}`);
   } finally {
     pollBusy = false;
@@ -317,18 +281,14 @@ async function poll() {
 }
 
 /*** =========================
- * Control Handler
+ * Control
  * ========================= */
 async function setBlockingEnabled(enable) {
-  // /api/settings/set?token=x&enableBlocking=true|false :contentReference[oaicite:9]{index=9}
   await apiGet('settings/set', { enableBlocking: enable ? 'true' : 'false' });
-
-  // Nach erfolgreichem Set direkt neu poll'en (Serverzustand sauber übernehmen)
   await poll();
 }
 
 async function flushCache() {
-  // /api/cache/flush?token=x :contentReference[oaicite:10]{index=10}
   await apiGet('cache/flush', {});
 }
 
@@ -342,15 +302,13 @@ function wireControls() {
       await setBlockingEnabled(v);
     } catch (e) {
       logE(`Set enableBlocking failed: ${e?.message || e}`);
-      // Revert: GUI-Schalter zurück auf Serverzustand (per poll)
       await poll();
     }
   });
 
   on({ id: `${CFG.ROOT}.control.flushCache`, change: 'any' }, async (obj) => {
     if (!obj || obj.state.ack) return;
-    const pressed = !!obj.state.val;
-    if (!pressed) return;
+    if (!obj.state.val) return;
 
     try {
       logI('Flush cache requested');
@@ -358,21 +316,19 @@ function wireControls() {
     } catch (e) {
       logE(`Flush cache failed: ${e?.message || e}`);
     } finally {
-      // Button zurücksetzen
-      setStateIfChanged(`${CFG.ROOT}.control.flushCache`, false, true);
+      setIfChanged(`${CFG.ROOT}.control.flushCache`, false, true);
     }
   });
 
   on({ id: `${CFG.ROOT}.control.refresh`, change: 'any' }, async (obj) => {
     if (!obj || obj.state.ack) return;
-    const pressed = !!obj.state.val;
-    if (!pressed) return;
+    if (!obj.state.val) return;
 
     try {
       logI('Manual refresh requested');
       await poll();
     } finally {
-      setStateIfChanged(`${CFG.ROOT}.control.refresh`, false, true);
+      setIfChanged(`${CFG.ROOT}.control.refresh`, false, true);
     }
   });
 }
@@ -381,10 +337,9 @@ function wireControls() {
  * Start
  * ========================= */
 (function main() {
-  initObjects();
+  initStates();
   wireControls();
 
-  // initial poll + interval
   setTimeout(() => poll().catch(e => logW(`Initial poll failed: ${e?.message || e}`)), 1500);
 
   pollTimer = setInterval(() => {
@@ -395,5 +350,6 @@ function wireControls() {
     try { if (pollTimer) clearInterval(pollTimer); } catch { /* ignore */ }
   }, 1000);
 
-  logI(`Started. Endpoint=${CFG.HTTPS ? 'https' : 'http'}://${CFG.HOST}:${CFG.PORT}${buildBasePath()} (poll ${CFG.POLL_MS}ms)`);
+  logI(`Started. Endpoint=${CFG.HTTPS ? 'https' : 'http'}://${CFG.HOST}:${CFG.PORT}${basePath()} (poll ${CFG.POLL_MS}ms)`);
 })();
+
