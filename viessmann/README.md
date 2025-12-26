@@ -49,7 +49,7 @@ You may change these in the scripts’ `CFG` blocks if your layout differs.
 
 ---
 
-## Quick Start (TL;DR)
+## Quick Start
 
 1. **Poller Script (read)** – ensure your Poller is running and populates typical **V27‑style states** under `…ViessmannAPI.*` such as:
    - `Values.*` (outsideTemp, boilerTemp, c0_supplyTemp, dhwTarget, dhwActual, wifiRssi, burnerActive, burnerModulation, burnerStarts, hk0_curveSlope, hk0_curveShift, hk0_programActive, …)
